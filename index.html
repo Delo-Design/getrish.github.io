@@ -1,1 +1,9 @@
-echo "test!"
+ver=$( hostnamectl | grep -Eo 'Operating.*' |  sed 's@^[^0-9]*\([0-9]\+\).*@\1@ )
+if [[ ${ver} == "7" ]]
+then
+  echo "Для CentOS 7 будет установлена архивная версия скрипта. Советуем перейти на более свежую версию Alma Linux, Rocky Linux или Fedora"
+  yum install -y wget
+  
+else
+ echo "CentOS 8"
+fi
