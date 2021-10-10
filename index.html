@@ -14,7 +14,8 @@ then
   tar -xvf rish.tar.gz 
   cd rish || exit
   chmod u+x ri.sh 
-  ./ri.sh
+  echo 
+  echo "Теперь запустите установку с помощью команды ${GREEN}./ri.sh${WHITE}"
 else
   echo "Установка актуальной версии "
   yum install -y wget
@@ -23,5 +24,6 @@ else
   tar -xvf rish8.tar.gz 
   cd rish || exit
   chmod u+x ri.sh 
-  cat ri.sh | sh
+  echo 
+  echo "Теперь запустите установку с помощью команды ${GREEN}./ri.sh${WHITE}"
 fi
