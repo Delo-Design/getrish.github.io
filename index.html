@@ -16,5 +16,12 @@ then
   chmod u+x ri.sh 
   ./ri.sh
 else
- echo "CentOS 8"
+  echo "Установка актуальной версии "
+  yum install -y wget
+  cd ~
+  wget https://rish.su/rish8.tar.gz
+  tar -xvf rish.tar.gz 
+  cd rish || exit
+  chmod u+x ri.sh 
+  ./ri.sh
 fi
