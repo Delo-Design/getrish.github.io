@@ -6,6 +6,7 @@ ver=$( hostnamectl | grep -Eo 'Operating.*' |  sed 's@^[^0-9]*\([0-9]\+\).*@\1@'
 if [[ ${ver} == "7" ]]
 then
   yum install -y wget
+  yum install -y tar
   echo -e "Для CentOS 7 будет установлена ${RED}архивная${WHITE} версия скрипта."
   echo -e "Советуем перейти на более свежую версию "
   echo -e "${GREEN}Alma Linux, Rocky Linux или Fedora${WHITE}"
@@ -15,15 +16,16 @@ then
   cd rish || exit
   chmod u+x ri.sh 
   echo 
-  echo "Теперь запустите установку с помощью команды ${GREEN}./ri.sh${WHITE}"
+  echo -e "Теперь запустите установку с помощью команды ${GREEN}./ri.sh${WHITE}"
 else
   echo "Установка актуальной версии "
   yum install -y wget
+  yum install -y tar
   cd ~
   wget https://rish.su/rish8.tar.gz
   tar -xvf rish8.tar.gz 
   cd rish || exit
   chmod u+x ri.sh 
   echo 
-  echo "Теперь запустите установку с помощью команды ${GREEN}./ri.sh${WHITE}"
+  echo -e "Теперь запустите установку с помощью команды ${GREEN}./ri.sh${WHITE}"
 fi
