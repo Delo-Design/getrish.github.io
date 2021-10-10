@@ -1,9 +1,20 @@
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+LRED='\033[1;31m'
+WHITE='\033[0m'
 ver=$( hostnamectl | grep -Eo 'Operating.*' |  sed 's@^[^0-9]*\([0-9]\+\).*@\1@' )
 if [[ ${ver} == "7" ]]
 then
-  echo "Для CentOS 7 будет установлена архивная версия скрипта. Советуем перейти на более свежую версию Alma Linux, Rocky Linux или Fedora"
   yum install -y wget
-  
+  echo -e "Для CentOS 7 будет установлена ${RED}архивная${WHITE} версия скрипта."
+  echo -e "Советуем перейти на более свежую версию "
+  echo -e "${GREEN}Alma Linux, Rocky Linux или Fedora${WHITE}"
+  cd ~
+  wget https://rish.su/rish7.tar.gz
+  tar -xvf rish.tar.gz 
+  cd rish || exit
+  chmod u+x ri.sh 
+  ./ri.sh
 else
  echo "CentOS 8"
 fi
