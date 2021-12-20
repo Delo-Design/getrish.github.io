@@ -15,6 +15,9 @@ then
   tar -xvf rish7.tar.gz 
   cd rish || exit
   chmod u+x ri.sh 
+  echo -e "Для CentOS 7 будет установлена ${RED}архивная${WHITE} версия скрипта."
+  echo -e "Советуем перейти на более свежую версию: "
+  echo -e "${GREEN}Alma Linux, Rocky Linux или Fedora${WHITE}"
   echo 
   echo -e "Теперь запустите установку с помощью команды ${GREEN}rish/ri.sh${WHITE}"
   rm ../rish7.tar.gz
@@ -27,6 +30,7 @@ else
   tar -xvf rish8.tar.gz 
   cd rish || exit
   chmod u+x ri.sh 
+  yum install -y langpacks-en glibc-all-langpacks
   echo 
   echo -e "Теперь запустите установку с помощью команды ${GREEN}rish/ri.sh${WHITE}"
   rm ../rish8.tar.gz
