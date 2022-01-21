@@ -27,7 +27,7 @@ else
   yum install -y tar
   cd ~
   wget https://rish.su/rish8.tar.gz
-  tar -xvf rish8.tar.gz 
+  tar --no-same-owner -xvf rish8.tar.gz 
   cd rish || exit
   chmod u+x ri.sh 
   yum install -y langpacks-en glibc-all-langpacks
