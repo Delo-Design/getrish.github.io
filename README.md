@@ -5,4 +5,4 @@
 
 Команда начала установки:
 
- curl get.rish.su | sh
+    curl get.rish.su | sh
