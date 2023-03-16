@@ -1,37 +1,55 @@
+#!/bin/bash
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 LRED='\033[1;31m'
 WHITE='\033[0m'
+if (type lsb_release > /dev/null 2>&1); then
+  CURRENT_OS=$(lsb_release -d -s)
+  echo -e "Ваша версия Linux: ${RED}$CURRENT_OS${WHITE}"
+elif [[ -f /etc/system-release ]]; then
+  CURRENT_OS=$(head -1 /etc/system-release)
+  echo -e "Ваша версия Linux: ${GREEN}$CURRENT_OS${WHITE}"
+  echo
+elif [[ -f /etc/issue ]]; then
+  CURRENT_OS=$(head -2 /etc/issue)
+  echo -e "Ваша версия Linux: ${RED}$CURRENT_OS${WHITE}"
+else
+  echo -e "${RED}Невозможно определить вашу версию Linux${WHITE}"
+  exit 1
+fi
+if ! echo ${CURRENT_OS} | egrep -q "$SUPPORTED_OS"
+then
+   echo -e "Ваш дистрибутив Linux ${RED}не поддерживается${WHITE}"
+   exit 1
+fi
 ver=$( hostnamectl | grep -Eo 'Operating.*' |  sed 's@^[^0-9]*\([0-9]\+\).*@\1@' )
 if [[ ${ver} == "7" ]]
 then
-  yum install -y wget
-  yum install -y tar
-  echo -e "Для CentOS 7 будет установлена ${RED}архивная${WHITE} версия скрипта."
+  echo -e "Версия для CentOS 7 больше ${RED}не поддерживается${WHITE}."
   echo -e "Советуем перейти на более свежую версию "
   echo -e "${GREEN}Alma Linux, Rocky Linux или Fedora${WHITE}"
-  cd ~
-  wget https://rish.su/rish7.tar.gz
-  tar -xvf rish7.tar.gz 
-  cd rish || exit
-  chmod u+x ri.sh 
-  echo -e "Для CentOS 7 будет установлена ${RED}архивная${WHITE} версия скрипта."
-  echo -e "Советуем перейти на более свежую версию: "
-  echo -e "${GREEN}Alma Linux, Rocky Linux или Fedora${WHITE}"
-  echo 
-  echo -e "Теперь запустите установку с помощью команды ${GREEN}rish/ri.sh${WHITE}"
-  rm ../rish7.tar.gz
+  exit 1
 else
   echo "Установка актуальной версии "
   yum install -y wget
   yum install -y tar
   cd ~
-  wget https://rish.su/rish8.tar.gz
-  tar --no-same-owner -xvf rish8.tar.gz 
+  if ! wget https://rish.su/rish8.tar.gz
+  then
+    if ! wget https://api.github.com/repos/Delo-Design/rish/releases/latest -O - | awk -F \" -v RS="," '/browser_download_url/ {print $(NF-1)}' | xargs wget
+    then
+     echo -e "${RED}Не удалось скачать архив${WHITE}"
+     exit 1
+    fi
+  fi
+  tar --no-same-owner -xvf rish8.tar.gz
   cd rish || exit
-  chmod u+x ri.sh 
+  chmod u+x ri.sh
+  chmod u+x backup.sh
   yum install -y langpacks-en glibc-all-langpacks
-  echo 
+  echo -e "Ваша версия Linux: ${GREEN}$CURRENT_OS${WHITE}"
+  echo
+  echo
   echo -e "Теперь запустите установку с помощью команды ${GREEN}rish/ri.sh${WHITE}"
   rm ../rish8.tar.gz
 fi
