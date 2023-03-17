@@ -12,3 +12,4 @@
     curl getrish.sovmart.com | sh
     
     
+Сайт RISH https://rish.su/
