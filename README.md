@@ -5,11 +5,14 @@
 
 Команда начала установки:
 
-    curl get.rish.su | sh
+    curl -L get.rish.su | sh
 
-если у вас блокируются сервера РФ, то вот эта команда:
+Если у вас блокируются сервера РФ, то вот эта команда:
 
-    curl getrish.sovmart.com | sh
-    
+    curl -L getrish.sovmart.com | sh
+
+Если на сервере не окажется установленной команды curl – ее можно установить с помощью 
+
+    dnf install curl
     
 Сайт RISH https://rish.su/
