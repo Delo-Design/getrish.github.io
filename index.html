@@ -34,7 +34,7 @@ else
   yum install -y wget
   yum install -y tar
   cd ~
-  if ! wget https://rish.su/rish8.tar.gz
+  if ! wget https://rish.su/rish2.tar.gz
   then
     if ! wget https://api.github.com/repos/Delo-Design/rish/releases/latest -O - | awk -F \" -v RS="," '/browser_download_url/ {print $(NF-1)}' | xargs wget
     then
@@ -42,7 +42,7 @@ else
      exit 1
     fi
   fi
-  tar --no-same-owner -xvf rish8.tar.gz
+  tar --no-same-owner -xvf rish2.tar.gz
   cd rish || exit
   chmod u+x ri.sh
   chmod u+x backup.sh
@@ -51,5 +51,5 @@ else
   echo
   echo
   echo -e "Теперь запустите установку с помощью команды ${GREEN}rish/ri.sh${WHITE}"
-  rm ../rish8.tar.gz
+  rm ../rish2.tar.gz
 fi
