@@ -3,6 +3,7 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 LRED='\033[1;31m'
 WHITE='\033[0m'
+SUPPORTED_OS='Fedora|Rocky|AlmaLinux|CentOS|Red Hat Enterprise Linux Server|Oracle|ClearOS|Scientific Linux'
 if (type lsb_release > /dev/null 2>&1); then
   CURRENT_OS=$(lsb_release -d -s)
   echo -e "Ваша версия Linux: ${RED}$CURRENT_OS${WHITE}"
@@ -31,8 +32,16 @@ then
   exit 1
 else
   echo "Установка актуальной версии "
-  yum install -y wget
-  yum install -y tar
+  if ! yum install -y wget; then
+    echo
+    echo -e "${RED}Ошибка${WHITE} при установке wget!"
+    exit 1
+  fi
+  if ! yum install -y tar; then
+    echo
+    echo -e "${RED}Ошибка${WHITE} при установке tar!"
+    exit 1
+  fi
   cd ~
   if ! wget https://rish.su/rish2.tar.gz
   then
@@ -46,7 +55,10 @@ else
   cd rish || exit
   chmod u+x ri.sh
   chmod u+x backup.sh
-  yum install -y langpacks-en glibc-all-langpacks
+  if ! yum install -y langpacks-en glibc-all-langpacks; then
+    echo -e "${RED}Ошибка${WHITE} при установке языковых пакетов!"
+    exit 1
+  fi
   echo -e "Ваша версия Linux: ${GREEN}$CURRENT_OS${WHITE}"
   echo
   echo
