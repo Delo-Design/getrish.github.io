@@ -16,3 +16,5 @@
     dnf install curl
     
 Сайт RISH https://rish.su/
+
+Ссылка на гитхаб RISH https://github.com/Delo-Design/rish
