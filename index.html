@@ -43,7 +43,7 @@ else
     exit 1
   fi
   cd ~
-  if ! wget https://rish.su/rish2.tar.gz
+  if ! wget wget --timeout=15 --tries=1 https://rish.su/rish2.tar.gz
   then
     if ! wget https://api.github.com/repos/Delo-Design/rish/releases/latest -O - | awk -F \" -v RS="," '/browser_download_url/ {print $(NF-1)}' | xargs wget
     then
