@@ -20,10 +20,11 @@ else
   exit 1
 fi
 
-if ! echo "${CURRENT_OS}" | grep -Eq "$SUPPORTED_OS"
-then
-   echo -e "Ваш дистрибутив Linux ${RED}не поддерживается${WHITE}"
-   exit 1
+if [[ -f /etc/redhat-release ]] || grep -q 'ID_LIKE=.*rhel' /etc/os-release 2>/dev/null; then
+    echo "Система относится к семейству RHEL."
+else
+    echo "Система НЕ относится к семейству RHEL."
+    exit 1
 fi
 
 ver=$( hostnamectl | grep -Eo 'Operating.*' | sed 's@^[^0-9]*\([0-9]\+\).*@\1@' )
