@@ -63,7 +63,6 @@ else
   tar --no-same-owner -xvf rish2.tar.gz
   cd rish || exit
   chmod u+x ri.sh
-  chmod u+x backup.sh
 
   if ! dnf install -y langpacks-en glibc-all-langpacks; then
     echo -e "${RED}Ошибка${WHITE} при установке языковых пакетов!"
