@@ -4,6 +4,44 @@ RED='\033[0;31m'
 LRED='\033[1;31m'
 WHITE='\033[0m'
 SUPPORTED_OS='Fedora|Rocky|AlmaLinux|CentOS|Red Hat Enterprise Linux Server|Oracle|ClearOS|Scientific Linux'
+BOOTSTRAP_LOG="/root/rish-bootstrap.log"
+
+if grep -q '^[[:space:]]*export[[:space:]]\+MYSQLPASS=' /root/.bashrc 2>/dev/null; then
+  echo
+  echo -e "RISH уже установлен и первичная настройка сервера уже выполнена."
+  echo
+  echo -e "Повторный запуск команды установки не требуется."
+  echo -e "Для обновления или проверки RISH запустите ${GREEN}mc${WHITE}, нажмите ${GREEN}F2${WHITE}"
+  echo -e "и выберите пункт ${GREEN}Обновление/проверка RISH${WHITE}."
+  echo
+  exit 1
+fi
+
+Install() {
+  local package
+  local missing=()
+
+  for package in "$@"; do
+    if ! rpm -q "$package" >/dev/null 2>&1; then
+      missing+=("$package")
+    fi
+  done
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    echo -e "Пакеты ${GREEN}${*}${WHITE} уже установлены"
+    return 0
+  fi
+
+  echo -e "Устанавливаем пакеты ${GREEN}${missing[*]}${WHITE}..."
+  if dnf -q -y install "${missing[@]}" >>"$BOOTSTRAP_LOG" 2>&1; then
+    echo -e "Пакеты ${GREEN}${missing[*]}${WHITE} установлены"
+  else
+    echo
+    echo -e "${RED}Ошибка${WHITE} при установке ${missing[*]}!"
+    echo -e "Подробности записаны в ${GREEN}${BOOTSTRAP_LOG}${WHITE}"
+    exit 1
+  fi
+}
 
 if (type lsb_release > /dev/null 2>&1); then
   CURRENT_OS=$(lsb_release -d -s)
@@ -37,37 +75,31 @@ then
   exit 1
 else
   echo "Установка актуальной версии "
-  
-  if ! dnf install -y wget; then
-    echo
-    echo -e "${RED}Ошибка${WHITE} при установке wget!"
-    exit 1
-  fi
 
-  if ! dnf install -y tar; then
-    echo
-    echo -e "${RED}Ошибка${WHITE} при установке tar!"
-    exit 1
-  fi
+  Install tar
 
   cd ~ || exit
-  if ! wget --timeout=15 --tries=1 https://rish.su/rish2.tar.gz
+  echo "Скачиваем архив RISH..."
+  if ! curl -L --connect-timeout 15 --max-time 60 --fail --progress-bar -o rish2.tar.gz https://rish.su/rish2.tar.gz
   then
-    if ! wget https://api.github.com/repos/Delo-Design/rish/releases/latest -O - | awk -F \" -v RS="," '/browser_download_url/ {print $(NF-1)}' | xargs wget
+    echo "rish.su недоступен, пробуем скачать релиз с GitHub..."
+    release_url="$(curl -fsSL --connect-timeout 15 --max-time 30 https://api.github.com/repos/Delo-Design/rish/releases/latest | awk -F \" -v RS="," '/browser_download_url/ {print $(NF-1)}' | head -n 1)"
+    if [[ -z "$release_url" ]] || ! curl -L --connect-timeout 15 --max-time 60 --fail --progress-bar -o rish2.tar.gz "$release_url"
     then
-     echo -e "${RED}Не удалось скачать архив${WHITE}"
-     exit 1
+      echo -e "${RED}Не удалось скачать архив${WHITE}"
+      exit 1
     fi
   fi
 
-  tar --no-same-owner -xvf rish2.tar.gz
+  echo "Распаковываем RISH..."
+  if ! tar --no-same-owner -xzf rish2.tar.gz; then
+    echo -e "${RED}Не удалось распаковать архив RISH${WHITE}"
+    exit 1
+  fi
   cd rish || exit
   chmod u+x ri.sh
 
-  if ! dnf install -y langpacks-en glibc-all-langpacks; then
-    echo -e "${RED}Ошибка${WHITE} при установке языковых пакетов!"
-    exit 1
-  fi
+  Install langpacks-en glibc-all-langpacks
 
   echo -e "Ваша версия Linux: ${GREEN}$CURRENT_OS${WHITE}"
   echo
