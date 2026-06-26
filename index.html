@@ -82,6 +82,14 @@ print_current_os() {
   echo
 }
 
+print_step() {
+  step_number="$1"
+  step_text="$2"
+
+  echo
+  print_color "${GREEN}Шаг ${step_number}:${WHITE} ${step_text}"
+}
+
 Install() {
   missing_packages=""
 
@@ -97,6 +105,7 @@ Install() {
   fi
 
   print_color "Устанавливаем пакеты ${GREEN}${missing_packages# }${WHITE}..."
+  print_color "Это может занять несколько минут. Подробности: ${GREEN}${BOOTSTRAP_LOG}${WHITE}"
   if dnf -q -y install $missing_packages >>"$BOOTSTRAP_LOG" 2>&1; then
     print_color "Пакеты ${GREEN}${missing_packages# }${WHITE} установлены"
   else
@@ -118,6 +127,7 @@ if grep -Eq '^[[:space:]]*export[[:space:]]+MYSQLPASS=' /root/.bashrc 2>/dev/nul
   exit 1
 fi
 
+print_step "1/4" "проверяем систему"
 detect_current_os
 
 if is_rhel_family; then
@@ -145,10 +155,10 @@ if [ "$ver" = "7" ]; then
   exit 1
 fi
 
-echo "Установка актуальной версии"
-
+print_step "2/4" "устанавливаем tar для распаковки архива"
 Install tar
 
+print_step "3/4" "скачиваем и распаковываем RISH"
 cd ~ || exit 1
 echo "Скачиваем архив RISH..."
 if ! curl -L --connect-timeout 15 --max-time 60 --fail --progress-bar -o rish2.tar.gz https://rish.su/rish2.tar.gz
@@ -170,6 +180,7 @@ fi
 cd rish || exit 1
 chmod u+x ri.sh
 
+print_step "4/4" "устанавливаем языковые пакеты UTF-8"
 Install langpacks-en glibc-all-langpacks
 
 print_color "Ваша версия Linux: ${GREEN}${CURRENT_OS}${WHITE}"
