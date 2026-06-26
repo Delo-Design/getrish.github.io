@@ -1,109 +1,173 @@
-#!/bin/bash
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-LRED='\033[1;31m'
-WHITE='\033[0m'
+#!/bin/sh
+GREEN="$(printf '\033[0;32m')"
+RED="$(printf '\033[0;31m')"
+WHITE="$(printf '\033[0m')"
 BOOTSTRAP_LOG="/root/rish-bootstrap.log"
 
-if grep -q '^[[:space:]]*export[[:space:]]\+MYSQLPASS=' /root/.bashrc 2>/dev/null; then
-  echo
-  echo -e "RISH уже установлен и первичная настройка сервера уже выполнена."
-  echo
-  echo -e "Повторный запуск команды установки не требуется."
-  echo -e "Для обновления или проверки RISH запустите ${GREEN}mc${WHITE}, нажмите ${GREEN}F2${WHITE}"
-  echo -e "и выберите пункт ${GREEN}Обновление/проверка RISH${WHITE}."
-  echo
-  exit 1
-fi
+RISH_OS_RELEASE="${RISH_OS_RELEASE:-/etc/os-release}"
+RISH_REDHAT_RELEASE="${RISH_REDHAT_RELEASE:-/etc/redhat-release}"
+RISH_SYSTEM_RELEASE="${RISH_SYSTEM_RELEASE:-/etc/system-release}"
+RISH_ISSUE="${RISH_ISSUE:-/etc/issue}"
 
-Install() {
-  local package
-  local missing=()
+print_color() {
+  printf '%b\n' "$1"
+}
 
-  for package in "$@"; do
-    if ! rpm -q "$package" >/dev/null 2>&1; then
-      missing+=("$package")
+read_os_release_value() {
+  key="$1"
+
+  if [ ! -f "$RISH_OS_RELEASE" ]; then
+    return 1
+  fi
+
+  value="$(awk -F= -v key="$key" '
+    $1 == key {
+      value = substr($0, index($0, "=") + 1)
+      gsub(/^"/, "", value)
+      gsub(/"$/, "", value)
+      print value
+      exit
+    }
+  ' "$RISH_OS_RELEASE")"
+
+  [ -n "$value" ] || return 1
+  printf '%s\n' "$value"
+}
+
+detect_current_os() {
+  if [ "$RISH_OS_RELEASE" = "/etc/os-release" ] && command -v lsb_release >/dev/null 2>&1; then
+    CURRENT_OS="$(lsb_release -d -s)"
+  elif [ -f "$RISH_SYSTEM_RELEASE" ]; then
+    CURRENT_OS="$(head -n 1 "$RISH_SYSTEM_RELEASE")"
+  elif [ -f "$RISH_OS_RELEASE" ]; then
+    CURRENT_OS="$(read_os_release_value PRETTY_NAME 2>/dev/null || true)"
+    if [ -z "$CURRENT_OS" ]; then
+      CURRENT_OS="$(read_os_release_value NAME 2>/dev/null || true)"
     fi
-  done
+  elif [ -f "$RISH_ISSUE" ]; then
+    CURRENT_OS="$(head -n 2 "$RISH_ISSUE")"
+  else
+    print_color "${RED}Невозможно определить вашу версию Linux${WHITE}"
+    exit 1
+  fi
 
-  if [[ ${#missing[@]} -eq 0 ]]; then
-    echo -e "Пакеты ${GREEN}${*}${WHITE} уже установлены"
+  print_color "Ваша версия Linux: ${GREEN}${CURRENT_OS}${WHITE}"
+  echo
+}
+
+is_rhel_family() {
+  if [ -f "$RISH_REDHAT_RELEASE" ]; then
     return 0
   fi
 
-  echo -e "Устанавливаем пакеты ${GREEN}${missing[*]}${WHITE}..."
-  if dnf -q -y install "${missing[@]}" >>"$BOOTSTRAP_LOG" 2>&1; then
-    echo -e "Пакеты ${GREEN}${missing[*]}${WHITE} установлены"
+  id_like="$(read_os_release_value ID_LIKE 2>/dev/null || true)"
+  case " $id_like " in
+    *" rhel "*) return 0 ;;
+  esac
+
+  return 1
+}
+
+print_unsupported_os_message() {
+  echo "Система НЕ относится к поддерживаемому семейству RHEL."
+  echo "RISH устанавливается на AlmaLinux, Rocky Linux, RHEL и совместимые RHEL-системы."
+  echo
+  echo "Ubuntu/Debian и другие не-RHEL дистрибутивы не поддерживаются:"
+  echo "RISH глубоко меняет настройки сервера,"
+  echo "поэтому мы работаем только с предсказуемым RHEL-family окружением."
+}
+
+Install() {
+  missing_packages=""
+
+  for package in "$@"; do
+    if ! rpm -q "$package" >/dev/null 2>&1; then
+      missing_packages="${missing_packages} ${package}"
+    fi
+  done
+
+  if [ -z "$missing_packages" ]; then
+    print_color "Пакеты ${GREEN}$*${WHITE} уже установлены"
+    return 0
+  fi
+
+  print_color "Устанавливаем пакеты ${GREEN}${missing_packages# }${WHITE}..."
+  if dnf -q -y install $missing_packages >>"$BOOTSTRAP_LOG" 2>&1; then
+    print_color "Пакеты ${GREEN}${missing_packages# }${WHITE} установлены"
   else
     echo
-    echo -e "${RED}Ошибка${WHITE} при установке ${missing[*]}!"
-    echo -e "Подробности записаны в ${GREEN}${BOOTSTRAP_LOG}${WHITE}"
+    print_color "${RED}Ошибка${WHITE} при установке ${missing_packages# }!"
+    print_color "Подробности записаны в ${GREEN}${BOOTSTRAP_LOG}${WHITE}"
     exit 1
   fi
 }
 
-if (type lsb_release > /dev/null 2>&1); then
-  CURRENT_OS=$(lsb_release -d -s)
-  echo -e "Ваша версия Linux: ${RED}$CURRENT_OS${WHITE}"
-elif [[ -f /etc/system-release ]]; then
-  CURRENT_OS=$(head -1 /etc/system-release)
-  echo -e "Ваша версия Linux: ${GREEN}$CURRENT_OS${WHITE}"
+if grep -Eq '^[[:space:]]*export[[:space:]]+MYSQLPASS=' /root/.bashrc 2>/dev/null; then
   echo
-elif [[ -f /etc/issue ]]; then
-  CURRENT_OS=$(head -2 /etc/issue)
-  echo -e "Ваша версия Linux: ${RED}$CURRENT_OS${WHITE}"
-else
-  echo -e "${RED}Невозможно определить вашу версию Linux${WHITE}"
+  print_color "RISH уже установлен и первичная настройка сервера уже выполнена."
+  echo
+  print_color "Повторный запуск команды установки не требуется."
+  print_color "Для обновления или проверки RISH запустите ${GREEN}mc${WHITE}, нажмите ${GREEN}F2${WHITE}"
+  print_color "и выберите пункт ${GREEN}Обновление/проверка RISH${WHITE}."
+  echo
   exit 1
 fi
 
-if [[ -f /etc/redhat-release ]] || grep -q 'ID_LIKE=.*rhel' /etc/os-release 2>/dev/null; then
-    echo "Система относится к семейству RHEL."
+detect_current_os
+
+if is_rhel_family; then
+  echo "Система относится к семейству RHEL."
 else
-    echo "Система НЕ относится к семейству RHEL."
-    exit 1
+  print_unsupported_os_message
+  exit 1
 fi
 
-ver=$( hostnamectl | grep -Eo 'Operating.*' | sed 's@^[^0-9]*\([0-9]\+\).*@\1@' )
+if [ "${RISH_BOOTSTRAP_PREFLIGHT_ONLY:-0}" = "1" ]; then
+  exit 0
+fi
 
-if [[ ${ver} == "7" ]]
+ver="$(hostnamectl 2>/dev/null | grep -Eo 'Operating.*' | sed 's@^[^0-9]*\([0-9]\+\).*@\1@')"
+if [ -z "$ver" ] && [ -f "$RISH_REDHAT_RELEASE" ]; then
+  ver="$(sed 's@^[^0-9]*\([0-9]\+\).*@\1@' "$RISH_REDHAT_RELEASE")"
+fi
+
+if [ "$ver" = "7" ]; then
+  print_color "Версия для CentOS 7 больше ${RED}не поддерживается${WHITE}."
+  echo "Советуем перейти на более свежую версию"
+  print_color "${GREEN}AlmaLinux, Rocky Linux или RHEL-compatible систему${WHITE}"
+  exit 1
+fi
+
+echo "Установка актуальной версии"
+
+Install tar
+
+cd ~ || exit 1
+echo "Скачиваем архив RISH..."
+if ! curl -L --connect-timeout 15 --max-time 60 --fail --progress-bar -o rish2.tar.gz https://rish.su/rish2.tar.gz
 then
-  echo -e "Версия для CentOS 7 больше ${RED}не поддерживается${WHITE}."
-  echo -e "Советуем перейти на более свежую версию "
-  echo -e "${GREEN}Alma Linux, Rocky Linux или Fedora${WHITE}"
-  exit 1
-else
-  echo "Установка актуальной версии "
-
-  Install tar
-
-  cd ~ || exit
-  echo "Скачиваем архив RISH..."
-  if ! curl -L --connect-timeout 15 --max-time 60 --fail --progress-bar -o rish2.tar.gz https://rish.su/rish2.tar.gz
+  echo "rish.su недоступен, пробуем скачать релиз с GitHub..."
+  release_url="$(curl -fsSL --connect-timeout 15 --max-time 30 https://api.github.com/repos/Delo-Design/rish/releases/latest | awk -F \" -v RS="," '/browser_download_url/ {print $(NF-1)}' | head -n 1)"
+  if [ -z "$release_url" ] || ! curl -L --connect-timeout 15 --max-time 60 --fail --progress-bar -o rish2.tar.gz "$release_url"
   then
-    echo "rish.su недоступен, пробуем скачать релиз с GitHub..."
-    release_url="$(curl -fsSL --connect-timeout 15 --max-time 30 https://api.github.com/repos/Delo-Design/rish/releases/latest | awk -F \" -v RS="," '/browser_download_url/ {print $(NF-1)}' | head -n 1)"
-    if [[ -z "$release_url" ]] || ! curl -L --connect-timeout 15 --max-time 60 --fail --progress-bar -o rish2.tar.gz "$release_url"
-    then
-      echo -e "${RED}Не удалось скачать архив${WHITE}"
-      exit 1
-    fi
-  fi
-
-  echo "Распаковываем RISH..."
-  if ! tar --no-same-owner -xzf rish2.tar.gz; then
-    echo -e "${RED}Не удалось распаковать архив RISH${WHITE}"
+    print_color "${RED}Не удалось скачать архив${WHITE}"
     exit 1
   fi
-  cd rish || exit
-  chmod u+x ri.sh
-
-  Install langpacks-en glibc-all-langpacks
-
-  echo -e "Ваша версия Linux: ${GREEN}$CURRENT_OS${WHITE}"
-  echo
-  echo
-  echo -e "Теперь запустите установку с помощью команды ${GREEN}/root/rish/ri.sh${WHITE}"
-  rm -f "$BOOTSTRAP_LOG"
-  rm ../rish2.tar.gz
 fi
+
+echo "Распаковываем RISH..."
+if ! tar --no-same-owner -xzf rish2.tar.gz; then
+  print_color "${RED}Не удалось распаковать архив RISH${WHITE}"
+  exit 1
+fi
+cd rish || exit 1
+chmod u+x ri.sh
+
+Install langpacks-en glibc-all-langpacks
+
+print_color "Ваша версия Linux: ${GREEN}${CURRENT_OS}${WHITE}"
+echo
+echo
+print_color "Теперь запустите установку с помощью команды ${GREEN}/root/rish/ri.sh${WHITE}"
+rm -f "$BOOTSTRAP_LOG"
+rm ../rish2.tar.gz
