@@ -51,8 +51,6 @@ detect_current_os() {
     exit 1
   fi
 
-  print_color "Ваша версия Linux: ${GREEN}${CURRENT_OS}${WHITE}"
-  echo
 }
 
 is_rhel_family() {
@@ -69,12 +67,19 @@ is_rhel_family() {
 }
 
 print_unsupported_os_message() {
-  echo "Система НЕ относится к поддерживаемому семейству RHEL."
+  print_color "Система ${RED}НЕ относится${WHITE} к поддерживаемому семейству RHEL."
   echo "RISH устанавливается на AlmaLinux, Rocky Linux, RHEL и совместимые RHEL-системы."
   echo
   echo "Ubuntu/Debian и другие не-RHEL дистрибутивы не поддерживаются:"
   echo "RISH глубоко меняет настройки сервера,"
   echo "поэтому мы работаем только с предсказуемым RHEL-family окружением."
+}
+
+print_current_os() {
+  os_color="$1"
+
+  print_color "Ваша версия Linux: ${os_color}${CURRENT_OS}${WHITE}"
+  echo
 }
 
 Install() {
@@ -116,8 +121,10 @@ fi
 detect_current_os
 
 if is_rhel_family; then
-  echo "Система относится к семейству RHEL."
+  print_current_os "$GREEN"
+  print_color "Система ${GREEN}относится${WHITE} к семейству RHEL."
 else
+  print_current_os "$RED"
   print_unsupported_os_message
   exit 1
 fi
