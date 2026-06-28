@@ -1,3 +1,4 @@
+
 # getrish.github.io
 Скрипт для начала установки RISH на новый сервер
 
@@ -23,3 +24,5 @@ Ubuntu/Debian и другие не-RHEL дистрибутивы не подде
 Сайт RISH https://rish.su/
 
 Ссылка на гитхаб RISH https://github.com/Delo-Design/rish
+
+<img width="1672" height="941" alt="rish Image 28 июн  2026 г , 10_35_15" src="https://github.com/user-attachments/assets/93425dc8-ecd9-43e5-8f1a-3eef67935b02" />
