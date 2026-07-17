@@ -1,0 +1,1013 @@
+#!/usr/bin/env bash
+#set -euo pipefail
+#IFS=$'\n\t'
+
+# little helpers for terminal print control and key input
+ESC=$( printf "\033")
+cursor_blink_on()     { printf "%s" "${ESC}[?25h"; }
+cursor_blink_off()    { printf "%s" "${ESC}[?25l"; }
+mouse_tracking_on()   { printf "%s" "${ESC}[?1000h${ESC}[?1006h"; }
+mouse_tracking_off()  { printf "%s" "${ESC}[?1006l${ESC}[?1000l"; }
+
+VERTICAL_MENU_LAST_WHEEL_MS=0
+VERTICAL_MENU_MOUSE_TRACKING_ENABLED=1
+
+# Метаданные последнего отрисованного меню (обновляются в vertical_menu)
+VERTICAL_MENU_LAST_WIDTH=0
+VERTICAL_MENU_LAST_OUTER_WIDTH=0
+VERTICAL_MENU_LAST_HEIGHT=0
+VERTICAL_MENU_LAST_X=0
+VERTICAL_MENU_LAST_Y=0
+VERTICAL_MENU_LAST_RIGHT_X=0
+VERTICAL_MENU_LAST_VISIBLE_SELECTED=0
+
+vertical_menu_next_x() {
+  local gap="${1:-1}"
+  echo $((VERTICAL_MENU_LAST_RIGHT_X + gap + 1))
+}
+
+cursor_to() {
+  local row="$1"
+  local col="${2:-1}"
+  printf "%s" "${ESC}[${row};${col}H"
+}
+
+print_option()        { printf "%s " "$1"; }
+print_selected_on()   { printf "%s" "${ESC}[7m"; }
+print_selected_off()  { printf "%s" "${ESC}[27m"; }
+
+clear_input_buffer() {
+  # Удаляем мусор из stdin
+  local dummy
+  while IFS= read -rsn1 -t 0.01 dummy 2>/dev/null; do :; done
+}
+
+drain_input_tail() {
+  # Слить хвост неизвестной escape-последовательности, чтобы он не "протек" в UI.
+  local dummy
+  while IFS= read -rsn1 -t 0.001 dummy 2>/dev/null; do :; done
+}
+
+vertical_menu_cleanup() {
+  mouse_tracking_off
+  cursor_blink_on
+  if [[ -n "$stty_state" ]]; then
+    stty "$stty_state"
+  fi
+}
+
+vertical_menu_restore_traps() {
+  if [[ -n "$previous_int_trap" ]]; then eval "$previous_int_trap"; else trap - INT; fi
+  if [[ -n "$previous_term_trap" ]]; then eval "$previous_term_trap"; else trap - TERM; fi
+  if [[ -n "$previous_hup_trap" ]]; then eval "$previous_hup_trap"; else trap - HUP; fi
+}
+
+vertical_menu_install_traps() {
+  trap 'vertical_menu_handle_signal INT' INT
+  trap 'vertical_menu_handle_signal TERM' TERM
+  trap 'vertical_menu_handle_signal HUP' HUP
+}
+
+vertical_menu_handle_signal() {
+  local signal="$1"
+  vertical_menu_cleanup
+  vertical_menu_restore_traps
+  kill -s "$signal" "$$"
+
+  # If the previous handler returned or ignored the signal, resume the menu.
+  vertical_menu_install_traps
+  if [[ -n "$stty_state" ]]; then
+    stty -echo
+  fi
+  if ((VERTICAL_MENU_MOUSE_TRACKING_ENABLED)); then
+    mouse_tracking_on
+  fi
+  cursor_blink_off
+}
+
+get_time_ms() {
+  local now
+
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    now="${EPOCHREALTIME/./}"
+    printf "%s\n" "${now:0:${#now}-3}"
+    return
+  fi
+
+  now=$(date +%s%3N)
+  [[ "$now" =~ ^[0-9]+$ ]] && printf "%s\n" "$now" || printf "0\n"
+}
+
+get_cursor_row() {
+    local row col
+    IFS=';' read -sdR -p $'\E[6n' row col
+    row=${row#*[}
+    [[ "$row" =~ ^[0-9]+$ ]] && echo "$row" || echo 1
+}
+
+get_cursor_column() {
+    local row col
+    IFS=';' read -sdR -p $'\E[6n' row col
+    [[ "$col" =~ ^[0-9]+$ ]] && echo "$col" || echo 1
+}
+repl() {
+    local char="$1"
+    local count="$2"
+    local out
+
+    ((count > 0)) || return
+    printf -v out "%*s" "$count" ""
+    printf "%s" "${out// /$char}"
+}
+key_input() {
+    local result_var="$1"
+    local key=""
+    local c1=""
+    local c2=""
+    local c=""
+    local esc=$'\e'
+    local mouse_sequence=""
+    local mouse_button
+    local mouse_x
+    local mouse_y
+    local mouse_action
+    local mouse_wheel_ms
+
+    IFS= read -rsn1 key 2>/dev/null || true
+
+    if [[ "$key" == "$esc" ]]; then
+        # Одиночный ESC: продолжения нет.
+        if ! IFS= read -rsn1 -t 0.008 c1 2>/dev/null; then
+            printf -v "$result_var" "%s" "esc"
+            return
+        fi
+
+        # Поддерживаем стрелки вверх/вниз и SGR-события мыши.
+        if [[ "$c1" == "[" || "$c1" == "O" ]]; then
+            if IFS= read -rsn1 -t 0.008 c2 2>/dev/null; then
+                case "$c2" in
+                    A) printf -v "$result_var" "%s" "up"; return ;;
+                    B) printf -v "$result_var" "%s" "down"; return ;;
+                    "<")
+                        while IFS= read -rsn1 -t 0.008 c 2>/dev/null; do
+                            if [[ "$c" == "M" || "$c" == "m" ]]; then
+                                mouse_action="$c"
+                                break
+                            fi
+                            mouse_sequence+="$c"
+                            ((${#mouse_sequence} < 32)) || break
+                        done
+                        IFS=';' read -r mouse_button mouse_x mouse_y <<< "$mouse_sequence"
+                        if [[ "$mouse_button" =~ ^[0-9]+$ && "$mouse_x" =~ ^[0-9]+$ && "$mouse_y" =~ ^[0-9]+$ ]]; then
+                            if ((mouse_button & 64)); then
+                                mouse_wheel_ms=$(get_time_ms)
+                                if ((mouse_wheel_ms > 0 &&
+                                     mouse_wheel_ms - VERTICAL_MENU_LAST_WHEEL_MS < 30)); then
+                                    printf -v "$result_var" "%s" "other:mouse_wheel_ignored"
+                                    return
+                                fi
+                                VERTICAL_MENU_LAST_WHEEL_MS=$mouse_wheel_ms
+                                case $((mouse_button & 3)) in
+                                    0) printf -v "$result_var" "%s" "up"; return ;;
+                                    1) printf -v "$result_var" "%s" "down"; return ;;
+                                esac
+                            fi
+                            if [[ "$mouse_action" == "m" ]] && (( (mouse_button & 3) == 0 )); then
+                                printf -v "$result_var" "%s" "mouse_click:${mouse_x}:${mouse_y}"
+                                return
+                            fi
+                            printf -v "$result_var" "%s" "other:mouse_ignored"
+                            return
+                        fi
+                        ;;
+                esac
+            fi
+        fi
+
+        # Неизвестный ESC-ввод: сливаем хвост, чтобы избежать артефактов.
+        drain_input_tail
+        printf -v "$result_var" "%s" "other:${esc}${c1}${c2}"
+        return
+    fi
+
+    if [[ -z "$key" ]]; then
+        printf -v "$result_var" "%s" "enter"
+    else
+        printf -v "$result_var" "%s" "other:$key"
+    fi
+}
+
+
+
+function refresh_window {
+# формат вызова
+# refresh_window y x height width shift "@"
+
+	local MaxWindowWidth
+	local left_x
+	local top_y
+	local ReturnKey=""
+	local temp
+	local -a ms
+	local -a menu_items
+	local height
+	local i=0
+	local shift_y
+	ms=( "$@" )
+	left_x=${ms[1]}
+	top_y=${ms[0]}
+	MaxWindowWidth=${ms[3]}
+	menu_items=( "${ms[@]:5}" )
+	height=${ms[2]}
+	shift_y=${ms[4]}
+
+	cursor_to $(($top_y )) $(($left_x))
+	printf "┌"
+	repl "─" $(( $MaxWindowWidth + 3 ))
+	printf "┐"
+
+	for ((i=0;i<${height};i++))
+	do
+		cursor_to $(($top_y + ${i}  + 1)) $(($left_x))
+		print_option "│  ${menu_items[${i}+${shift_y}]}"
+		repl " " $(( ${MaxWindowWidth}-${#menu_items[${i}+${shift_y}]} - 1 ))
+		print_vertical_menu_right_border "$i" "$height" "$shift_y" "${#menu_items[@]}"
+	done
+
+	cursor_to $(($top_y + ${i} +1 )) $(($left_x))
+	printf "└"
+	repl "─" $(( $MaxWindowWidth + 3 ))
+	printf "┘"
+}
+
+print_vertical_menu_right_border() {
+  local row="$1"
+  local height="$2"
+  local shift_y="$3"
+  local item_count="$4"
+
+  if ((row == 0 && shift_y > 0)); then
+    printf "↑│"
+  elif ((row == height - 1 && shift_y + height < item_count)); then
+    printf "↓│"
+  else
+    printf " │"
+  fi
+}
+
+print_vertical_menu_selected_row() {
+  local top_y="$1"
+  local left_x="$2"
+  local selected="$3"
+  local height="$4"
+  local MaxWindowWidth="$5"
+  local shift_y="$6"
+  local menu_item="$7"
+  local item_count="$8"
+
+  cursor_to $(($top_y + $selected + 1)) $(($left_x))
+  printf "│ "
+  print_selected_on
+  printf " ${menu_item}"
+  repl " " $(($MaxWindowWidth - ${#menu_item}))
+  print_selected_off
+  print_vertical_menu_right_border "$selected" "$height" "$shift_y" "$item_count"
+}
+
+function vertical_menu {
+  # формат вызова
+  # vertical_menu y x height width "@"
+  # если x = center - то центрирование по горизонтали
+  # если y = 	center - то центрирование по вертикали
+  # 		 =	current - выводим меню в текущей строке
+  # 		 =	current_noclear - выводим меню в текущей строке без очистки после выбора,
+  #                курсор ставится под меню
+  # если height = 0 - не устанавливать высоты (она будет посчитана автоматически)
+  #			  = число - установить высоту окна равную числу. Пункты меню будут скролироваться
+  #	width = число. Если строка будет больше этого числа - то ширина будет расширена до него
+  # если среди пунктов меню встречается слово default со знаком =, то это значит установка пункта меню по умолчанию
+  # этот пункт меню будет выбранным при выводе меню
+  # если среди аргументов встречается слово nomouse, то меню не включает mouse tracking
+  # это оставляет колесо мыши для прокрутки терминального scrollback
+  # vertical_menu y x height width  "default=2" "First Item" "Second Item" "Third Item"
+  local MaxWindowWidth
+  local left_x
+  local top_y
+  local ReturnKey=""
+  local -a ms
+  local -a menu_items
+  local size
+  local lines
+  local columns
+  local current_y
+  local is_current_mode=0
+  local skip_lines=0
+  local required_bottom
+  local scroll_lines=0
+  local max_visible_height
+  local stty_state=""
+  local height
+  local shift_y=0
+  local el
+  local arg
+  local previous_int_trap
+  local previous_term_trap
+  local previous_hup_trap
+  local selected
+  local previous_selected
+  local mouse_tracking_enabled=1
+  local previous_mouse_tracking_enabled=$VERTICAL_MENU_MOUSE_TRACKING_ENABLED
+  size=$(stty size)
+  lines=${size% *}
+  columns=${size#* }
+
+  # Обработка и удаление аргумента default, если он присутствует
+  local default_selected_index=0
+  local new_menu_items=()
+  for arg in "$@"; do
+    if [[ $arg == default=* ]]; then
+      default_selected_index=${arg#default=}
+    elif [[ $arg == "nomouse" ]]; then
+      mouse_tracking_enabled=0
+    else
+      new_menu_items+=("$arg")
+    fi
+  done
+
+  ms=("${new_menu_items[@]:0:4}")
+  menu_items=("${new_menu_items[@]:4}")
+  if ((${#menu_items[@]} == 0)); then
+    return 255
+  fi
+  left_x=${ms[1]}
+  top_y=${ms[0]}
+  MaxWindowWidth=${ms[3]}
+  clear_input_buffer
+  current_y=$(get_cursor_row)
+
+  if ((${ms[2]} == 0)); then
+    height=${#menu_items[@]}
+  else
+    # если требуемая высота больше чем количество пунктов меню, уменьшаем ее
+    if ((${ms[2]} > ${#menu_items[@]})); then
+      height=${#menu_items[@]}
+    else
+      height=${ms[2]}
+    fi
+  fi
+
+  max_visible_height=$((lines - 2))
+  if ((max_visible_height < 1)); then
+    max_visible_height=1
+  fi
+  if ((height > max_visible_height)); then
+    height=$max_visible_height
+  fi
+
+  if [[ ! "$default_selected_index" =~ ^[0-9]+$ ]] || ((default_selected_index >= ${#menu_items[@]})); then
+    default_selected_index=0
+  fi
+  if ((default_selected_index >= height)); then
+    shift_y=$((default_selected_index - height + 1))
+    selected=$((height - 1))
+  else
+    selected=${default_selected_index}
+  fi
+  previous_selected=${selected}
+
+  #find the width of the window
+  for el in "${menu_items[@]}"; do
+    if ((${MaxWindowWidth} < ${#el})); then
+      MaxWindowWidth=${#el}
+    fi
+  done
+  ((MaxWindowWidth = ${MaxWindowWidth} + 2))
+
+  if [[ ${ms[1]} == "center" ]]; then
+    ((left_x = (${columns} - ${MaxWindowWidth} - 6) / 2))
+  fi
+  if [[ ${ms[0]} == "center" ]]; then
+    ((top_y = (${lines} - ${height} - 2) / 2))
+  fi
+
+  if [[ ${ms[0]} == "current" || ${ms[0]} == "current_noclear" ]]; then
+    is_current_mode=1
+    top_y=${current_y}
+  fi
+
+  # Для любого режима обеспечиваем место под меню за счет скролла терминала.
+  required_bottom=$((top_y + height + 1))
+  if ((required_bottom > lines)); then
+    scroll_lines=$((required_bottom - lines))
+    if ((scroll_lines > 0)); then
+      echo -en ${ESC}"[${scroll_lines}S"
+      top_y=$((top_y - scroll_lines))
+      if ((is_current_mode == 1)); then
+        current_y=$top_y
+        skip_lines=$((skip_lines + scroll_lines))
+      fi
+    fi
+  fi
+
+  stty_state="$(stty -g 2>/dev/null || true)"
+  if [[ -n "$stty_state" ]]; then
+    stty -echo
+  fi
+  # Ensure terminal state is restored if the menu is interrupted while waiting for keys.
+  previous_int_trap="$(trap -p INT)"
+  previous_term_trap="$(trap -p TERM)"
+  previous_hup_trap="$(trap -p HUP)"
+  vertical_menu_install_traps
+  VERTICAL_MENU_MOUSE_TRACKING_ENABLED=$mouse_tracking_enabled
+  if ((VERTICAL_MENU_MOUSE_TRACKING_ENABLED)); then
+    mouse_tracking_on
+  fi
+  cursor_blink_off
+  refresh_window ${top_y} ${left_x} ${height} ${MaxWindowWidth} ${shift_y} "${menu_items[@]}"
+
+  # Сохраняем геометрию окна для последующего позиционирования
+  VERTICAL_MENU_LAST_WIDTH=${MaxWindowWidth}
+  VERTICAL_MENU_LAST_OUTER_WIDTH=$((MaxWindowWidth + 5))
+  VERTICAL_MENU_LAST_HEIGHT=$((height + 2))
+  VERTICAL_MENU_LAST_X=${left_x}
+  VERTICAL_MENU_LAST_Y=${top_y}
+  VERTICAL_MENU_LAST_RIGHT_X=$((left_x + VERTICAL_MENU_LAST_OUTER_WIDTH - 1))
+
+  while true; do
+    # print options by overwriting the last lines
+
+    cursor_to $(($top_y + $previous_selected + 1)) $(($left_x))
+    print_option "│  ${menu_items[$previous_selected + ${shift_y}]}"
+    repl " " $(($MaxWindowWidth - ${#menu_items[$previous_selected + ${shift_y}]} - 1))
+    print_vertical_menu_right_border "$previous_selected" "$height" "$shift_y" "${#menu_items[@]}"
+
+    print_vertical_menu_selected_row "$top_y" "$left_x" "$selected" "$height" "$MaxWindowWidth" "$shift_y" "${menu_items[$selected + $shift_y]}" "${#menu_items[@]}"
+
+    # user key control
+    key_input ReturnKey
+    case ${ReturnKey} in
+    enter) break ;;
+    esc)
+      selected=255
+      break
+      ;;
+    up)
+      previous_selected=${selected}
+      ((selected--))
+      if [[ ${selected} -lt 0 ]]; then
+        if ((${shift_y} > 0)); then
+          ((shift_y--))
+          refresh_window ${top_y} ${left_x} ${height} ${MaxWindowWidth} ${shift_y} "${menu_items[@]}"
+          cursor_blink_off
+        fi
+        selected=0
+      fi
+      ;;
+    down)
+      previous_selected=${selected}
+      ((selected++))
+      if [[ ${selected} -ge ${height} ]]; then
+        if (((${shift_y} + ${selected}) < ${#menu_items[@]})); then
+          ((shift_y++))
+          refresh_window ${top_y} ${left_x} ${height} ${MaxWindowWidth} ${shift_y} "${menu_items[@]}"
+          cursor_blink_off
+        fi
+        selected=${previous_selected}
+      fi
+      ;;
+    mouse_click:*)
+      local mouse_x
+      local mouse_y
+      IFS=':' read -r _ mouse_x mouse_y <<< "$ReturnKey"
+      if ((mouse_x >= left_x && mouse_x <= left_x + MaxWindowWidth + 4 &&
+           mouse_y >= top_y + 1 && mouse_y <= top_y + height)); then
+        cursor_to $(($top_y + $selected + 1)) $(($left_x))
+        print_option "│  ${menu_items[$selected + ${shift_y}]}"
+        repl " " $(($MaxWindowWidth - ${#menu_items[$selected + ${shift_y}]} - 1))
+        print_vertical_menu_right_border "$selected" "$height" "$shift_y" "${#menu_items[@]}"
+        selected=$((mouse_y - top_y - 1))
+        print_vertical_menu_selected_row "$top_y" "$left_x" "$selected" "$height" "$MaxWindowWidth" "$shift_y" "${menu_items[$selected + $shift_y]}" "${#menu_items[@]}"
+        sleep 0.08
+        break
+      fi
+      ;;
+    esac
+  done
+
+  VERTICAL_MENU_LAST_VISIBLE_SELECTED=${selected}
+
+  if ((is_current_mode == 1)); then
+    printf "\n"
+  fi
+  vertical_menu_cleanup
+  VERTICAL_MENU_MOUSE_TRACKING_ENABLED=$previous_mouse_tracking_enabled
+  vertical_menu_restore_traps
+  if ((is_current_mode == 1)); then
+    if [[ ${ms[0]} == "current" ]]; then
+      cursor_to ${current_y} 1
+    # очистить выведенное меню
+      echo -en ${ESC}"[0J"
+    else
+      cursor_to $((${top_y} + ${height} + 2)) 1
+    fi
+  else
+    cursor_to ${current_y} 1
+  fi
+  if ((selected != 255)); then
+    ((selected += ${shift_y}))
+  fi
+  return ${selected}
+}
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+WHITE='\033[0m'
+
+# LVM closes inherited nonstandard descriptors itself. Suppress harmless
+# warnings about descriptors retained by the interactive shell.
+export LVM_SUPPRESS_FD_WARNINGS=1
+
+ROOT_SOURCE=""
+ROOT_FSTYPE=""
+ROOT_LV=""
+ROOT_VG=""
+ROOT_SIZE_BYTES=0
+HOME_SOURCE=""
+HOME_FSTYPE=""
+HOME_LV=""
+HOME_VG=""
+HOME_SIZE_BYTES=0
+EXPECTED_ROOT_SIZE_BYTES=0
+
+TRANSACTION_ACTIVE=0
+TRANSACTION_HOME_UNMOUNTED=0
+TRANSACTION_FSTAB_CHANGED=0
+TRANSACTION_TEMP_FSTAB=""
+TRANSACTION_FSTAB_BACKUP=""
+
+wait_for_enter() {
+  vertical_menu "current" 2 0 5 nomouse "Нажмите Enter"
+}
+
+fail() {
+  echo
+  echo -e "${RED}Операция остановлена.${WHITE} $1" >&2
+  if [[ -t 0 && -t 1 ]]; then
+    wait_for_enter
+  fi
+  exit 1
+}
+
+cleanup_transaction() {
+  local status="$1"
+
+  if [[ -n "$TRANSACTION_TEMP_FSTAB" && -f "$TRANSACTION_TEMP_FSTAB" ]]; then
+    rm -f "$TRANSACTION_TEMP_FSTAB"
+  fi
+
+  if [[ "$status" -eq 0 || "$TRANSACTION_ACTIVE" -ne 1 ]]; then
+    return
+  fi
+
+  if [[ -n "$HOME_LV" ]] && lvs "$HOME_LV" >/dev/null 2>&1; then
+    if [[ "$TRANSACTION_FSTAB_CHANGED" -eq 1 && -f "$TRANSACTION_FSTAB_BACKUP" ]]; then
+      cp -a "$TRANSACTION_FSTAB_BACKUP" /etc/fstab
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    if [[ "$TRANSACTION_HOME_UNMOUNTED" -eq 1 ]] && ! mountpoint -q /home; then
+      mount /home >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+trap 'cleanup_transaction "$?"' EXIT
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 ||
+    fail "Не найдена необходимая команда ${YELLOW}$1${WHITE}."
+}
+
+single_value() {
+  awk 'NF { print $1; exit }'
+}
+
+numeric_value() {
+  awk 'NF { printf "%.0f\n", $1; exit }'
+}
+
+human_size() {
+  numfmt --to=iec-i --suffix=B "$1"
+}
+
+print_section() {
+  echo
+  echo -e "${YELLOW}$1${WHITE}"
+}
+
+get_lv_property() {
+  local lv="$1"
+  local property="$2"
+
+  lvs --noheadings -o "$property" "$lv" 2>/dev/null | single_value
+}
+
+get_lv_size_bytes() {
+  local lv="$1"
+
+  lvs --noheadings --units b --nosuffix -o lv_size "$lv" 2>/dev/null |
+    numeric_value
+}
+
+check_linear_lv() {
+  local lv="$1"
+  local segment_types
+
+  segment_types="$(
+    lvs --segments --noheadings -o segtype "$lv" 2>/dev/null |
+      awk 'NF { print $1 }' |
+      sort -u
+  )" || fail "Не удалось определить тип сегментов ${YELLOW}${lv}${WHITE}."
+
+  [[ "$segment_types" == "linear" ]] ||
+    fail "Том ${YELLOW}${lv}${WHITE} имеет неподдерживаемый тип сегментов: ${segment_types:-неизвестно}."
+}
+
+check_no_snapshots() {
+  local root_name
+  local home_name
+  local related_snapshots
+
+  root_name="$(get_lv_property "$ROOT_LV" lv_name)"
+  home_name="$(get_lv_property "$HOME_LV" lv_name)"
+  related_snapshots="$(
+    lvs --noheadings -o lv_name,origin "$ROOT_VG" 2>/dev/null |
+      awk -v root="$root_name" -v home="$home_name" \
+        'NF >= 2 && ($2 == root || $2 == home) { print $1 }'
+  )"
+
+  [[ -z "$related_snapshots" ]] ||
+    fail "Для root или home найдены snapshots: ${related_snapshots//$'\n'/, }."
+}
+
+check_directory_is_empty() {
+  local directory="$1"
+  local description="$2"
+  local first_entry
+
+  first_entry="$(find "$directory" -xdev -mindepth 1 -print -quit 2>/dev/null)" ||
+    fail "Не удалось проверить содержимое ${YELLOW}${directory}${WHITE}."
+
+  [[ -z "$first_entry" ]] ||
+    fail "${description} не пуст. Найден объект: ${YELLOW}${first_entry}${WHITE}. Никаких изменений не сделано."
+}
+
+check_home_usage() {
+  local users
+
+  users="$(fuser -m /home 2>/dev/null || true)"
+  [[ -z "${users//[[:space:]]/}" ]] ||
+    fail "Файловая система ${YELLOW}/home${WHITE} используется процессами: ${users}."
+}
+
+collect_and_validate_layout() {
+  local fstab_home_count
+  local fstab_home_source
+  local home_targets
+  local root_origin
+  local home_origin
+  local vg_free_bytes
+
+  [[ "$EUID" -eq 0 ]] ||
+    fail "Скрипт необходимо запускать от root."
+
+  require_command awk
+  require_command chmod
+  require_command chown
+  require_command cp
+  require_command date
+  require_command df
+  require_command find
+  require_command findmnt
+  require_command fuser
+  require_command lvs
+  require_command lvextend
+  require_command lvremove
+  require_command mkdir
+  require_command mktemp
+  require_command mount
+  require_command mountpoint
+  require_command mv
+  require_command numfmt
+  require_command readlink
+  require_command restorecon
+  require_command sort
+  require_command systemctl
+  require_command umount
+  require_command vgcfgbackup
+  require_command vgs
+  require_command xfs_growfs
+
+  ROOT_SOURCE="$(findmnt -n -o SOURCE /)" ||
+    fail "Не удалось определить устройство корневой файловой системы."
+  ROOT_FSTYPE="$(findmnt -n -o FSTYPE /)" ||
+    fail "Не удалось определить тип корневой файловой системы."
+  HOME_SOURCE="$(findmnt -n -o SOURCE /home)" ||
+    fail "Каталог /home не является отдельной смонтированной файловой системой."
+  HOME_FSTYPE="$(findmnt -n -o FSTYPE /home)" ||
+    fail "Не удалось определить тип файловой системы /home."
+
+  [[ "$ROOT_FSTYPE" == "xfs" ]] ||
+    fail "Корневая файловая система имеет тип ${YELLOW}${ROOT_FSTYPE}${WHITE}, ожидался XFS."
+  [[ "$HOME_FSTYPE" == "xfs" ]] ||
+    fail "Файловая система /home имеет тип ${YELLOW}${HOME_FSTYPE}${WHITE}, ожидался XFS."
+  [[ "$ROOT_SOURCE" != "$HOME_SOURCE" ]] ||
+    fail "Корень и /home используют одно устройство. Исправление не требуется."
+
+  ROOT_LV="$(lvs --noheadings -o lv_path "$ROOT_SOURCE" 2>/dev/null | single_value)"
+  HOME_LV="$(lvs --noheadings -o lv_path "$HOME_SOURCE" 2>/dev/null | single_value)"
+  [[ -n "$ROOT_LV" ]] ||
+    fail "Корневая файловая система ${YELLOW}${ROOT_SOURCE}${WHITE} не является поддерживаемым LVM-томом."
+  [[ -n "$HOME_LV" ]] ||
+    fail "Файловая система /home ${YELLOW}${HOME_SOURCE}${WHITE} не является поддерживаемым LVM-томом."
+
+  ROOT_VG="$(get_lv_property "$ROOT_LV" vg_name)"
+  HOME_VG="$(get_lv_property "$HOME_LV" vg_name)"
+  [[ -n "$ROOT_VG" && -n "$HOME_VG" ]] ||
+    fail "Не удалось определить группы томов root и home."
+  [[ "$ROOT_VG" == "$HOME_VG" ]] ||
+    fail "Root находится в VG ${YELLOW}${ROOT_VG}${WHITE}, а /home — в VG ${YELLOW}${HOME_VG}${WHITE}."
+
+  root_origin="$(get_lv_property "$ROOT_LV" origin)"
+  home_origin="$(get_lv_property "$HOME_LV" origin)"
+  [[ -z "$root_origin" && -z "$home_origin" ]] ||
+    fail "Root или /home является LVM snapshot. Такая конфигурация не поддерживается."
+
+  check_linear_lv "$ROOT_LV"
+  check_linear_lv "$HOME_LV"
+  check_no_snapshots
+
+  home_targets="$(findmnt -rn -o TARGET --source "$HOME_SOURCE" | sort -u)"
+  [[ "$home_targets" == "/home" ]] ||
+    fail "Том ${YELLOW}${HOME_LV}${WHITE} смонтирован не только как /home: ${home_targets//$'\n'/, }."
+
+  fstab_home_count="$(
+    awk '$0 !~ /^[[:space:]]*#/ && NF >= 2 && $2 == "/home" { count++ } END { print count + 0 }' /etc/fstab
+  )"
+  [[ "$fstab_home_count" -eq 1 ]] ||
+    fail "В /etc/fstab должна быть ровно одна активная запись /home, найдено: ${fstab_home_count}."
+
+  fstab_home_source="$(findmnt --fstab --evaluate -n -o SOURCE /home 2>/dev/null)" ||
+    fail "Не удалось определить устройство /home из /etc/fstab."
+  [[ "$(readlink -f -- "$fstab_home_source")" == "$(readlink -f -- "$HOME_SOURCE")" ]] ||
+    fail "В /etc/fstab для /home указано ${YELLOW}${fstab_home_source}${WHITE}, а смонтировано ${YELLOW}${HOME_SOURCE}${WHITE}."
+
+  vg_free_bytes="$(
+    vgs --noheadings --units b --nosuffix -o vg_free "$ROOT_VG" 2>/dev/null |
+      numeric_value
+  )"
+  [[ "$vg_free_bytes" =~ ^[0-9]+$ ]] ||
+    fail "Не удалось определить свободное место в VG ${YELLOW}${ROOT_VG}${WHITE}."
+  [[ "$vg_free_bytes" -eq 0 ]] ||
+    fail "В VG ${YELLOW}${ROOT_VG}${WHITE} уже есть свободное место. Обнаружена нетипичная разметка."
+
+  ROOT_SIZE_BYTES="$(get_lv_size_bytes "$ROOT_LV")"
+  HOME_SIZE_BYTES="$(get_lv_size_bytes "$HOME_LV")"
+  [[ "$ROOT_SIZE_BYTES" =~ ^[0-9]+$ && "$HOME_SIZE_BYTES" =~ ^[0-9]+$ ]] ||
+    fail "Не удалось определить размеры LVM-томов."
+
+  EXPECTED_ROOT_SIZE_BYTES=$((ROOT_SIZE_BYTES + HOME_SIZE_BYTES))
+  [[ "$EXPECTED_ROOT_SIZE_BYTES" -gt "$ROOT_SIZE_BYTES" ]] ||
+    fail "Корневой том невозможно увеличить за счет /home."
+
+  check_directory_is_empty /home "Смонтированная файловая система /home"
+  check_home_usage
+}
+
+print_explanation_and_plan() {
+  clear
+  echo "Почему доступно меньше места, чем размер диска"
+  echo
+  echo "При автоматической разметке диска от 50 GiB установщик Anaconda"
+  echo "создает отдельный LVM-том для /home. Место не пропало: оно доступно"
+  echo "внутри /home, но корневая файловая система / его не использует."
+  echo
+  echo "На сервере, где данные размещаются в /var/www, отдельный пустой /home"
+  echo "обычно не нужен. Его место можно передать корневой файловой системе."
+  echo
+  echo "Проверенная разметка:"
+  echo -e "  Корневой LV:                  ${GREEN}${ROOT_LV}${WHITE}"
+  echo -e "  Текущий размер /:             ${GREEN}$(human_size "$ROOT_SIZE_BYTES")${WHITE}"
+  echo -e "  LV для /home:                 ${GREEN}${HOME_LV}${WHITE}"
+  echo -e "  Освободится из /home:         ${GREEN}$(human_size "$HOME_SIZE_BYTES")${WHITE}"
+  echo -e "  Группа томов:                 ${GREEN}${ROOT_VG}${WHITE}"
+  echo -e "  Ожидаемый размер /:           ${GREEN}$(human_size "$EXPECTED_ROOT_SIZE_BYTES")${WHITE}"
+  echo
+  echo -e "Файловая система ${GREEN}/home пуста${WHITE} и не используется процессами."
+  echo
+  echo "Будут созданы резервные копии /etc/fstab и метаданных LVM."
+  echo "Затем пустой LV /home будет удален, а корневой LV и XFS — увеличены."
+  echo
+}
+
+prepare_fstab_without_home() {
+  local temp_fstab="$1"
+
+  awk '
+    $0 !~ /^[[:space:]]*#/ && NF >= 2 && $2 == "/home" { next }
+    { print }
+  ' /etc/fstab >"$temp_fstab" ||
+    fail "Не удалось подготовить новую версию /etc/fstab."
+
+  chmod --reference=/etc/fstab "$temp_fstab" ||
+    fail "Не удалось сохранить права /etc/fstab."
+  chown --reference=/etc/fstab "$temp_fstab" ||
+    fail "Не удалось сохранить владельца /etc/fstab."
+
+  findmnt --verify --tab-file "$temp_fstab" >/dev/null ||
+    fail "Проверка новой версии /etc/fstab завершилась ошибкой."
+}
+
+confirm_operation() {
+  local choice
+
+  vertical_menu "current" 2 0 5 default=0 \
+    "Отмена — ничего не менять" \
+    "Продолжить проверку и подготовку"
+  choice=$?
+  [[ "$choice" -eq 1 ]] || {
+    echo "Никаких изменений не сделано."
+    return 1
+  }
+
+  collect_and_validate_layout
+  print_explanation_and_plan
+
+  echo -e "${YELLOW}Внимание:${WHITE} том ${YELLOW}${HOME_LV}${WHITE} будет безвозвратно удален."
+  echo "Это допустимо только потому, что /home полностью пуст."
+  echo
+  vertical_menu "current" 2 0 5 default=0 \
+    "Нет — отменить операцию" \
+    "Да — удалить пустой ${HOME_LV}"
+  choice=$?
+  [[ "$choice" -eq 1 ]] || {
+    echo "Никаких изменений не сделано."
+    return 1
+  }
+
+  return 0
+}
+
+apply_changes() {
+  local timestamp
+  local vg_backup
+  local final_root_size
+  local reboot_choice
+
+  check_directory_is_empty /home "Смонтированная файловая система /home"
+  check_home_usage
+
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  TRANSACTION_FSTAB_BACKUP="/root/fstab.before-home-merge.${timestamp}"
+  vg_backup="/root/${ROOT_VG}.before-home-merge.${timestamp}.vg"
+  TRANSACTION_TEMP_FSTAB="$(mktemp /etc/fstab.fix-home.XXXXXX)" ||
+    fail "Не удалось создать временный файл рядом с /etc/fstab."
+  TRANSACTION_ACTIVE=1
+
+  prepare_fstab_without_home "$TRANSACTION_TEMP_FSTAB"
+
+  print_section "Создание резервных копий /etc/fstab и LVM"
+  echo "Сохраняем копию файла /etc/fstab."
+  echo "Этот системный файл определяет подключение дисков"
+  echo "и файловых систем при загрузке сервера:"
+  echo -e "  ${GREEN}${TRANSACTION_FSTAB_BACKUP}${WHITE}"
+  cp -a /etc/fstab "$TRANSACTION_FSTAB_BACKUP" ||
+    fail "Не удалось скопировать /etc/fstab."
+
+  echo
+  echo "Сохраняем метаданные LVM."
+  echo -e "Это описание структуры логических томов группы ${GREEN}${ROOT_VG}${WHITE}:"
+  echo -e "  ${GREEN}${vg_backup}${WHITE}"
+  vgcfgbackup -f "$vg_backup" "$ROOT_VG" >/dev/null ||
+    fail "Не удалось создать резервную копию метаданных LVM."
+
+  print_section "Удаление отдельного /home"
+  echo -e "Размонтируем ${GREEN}/home${WHITE}"
+  umount /home ||
+    fail "Не удалось размонтировать /home. LVM-том не удален."
+  TRANSACTION_HOME_UNMOUNTED=1
+
+  mountpoint -q /home &&
+    fail "/home остался смонтирован. LVM-том не удален."
+
+  check_directory_is_empty /home "Каталог /home внутри корневой файловой системы"
+
+  echo -e "Обновляем ${GREEN}/etc/fstab${WHITE}"
+  mv -f "$TRANSACTION_TEMP_FSTAB" /etc/fstab ||
+    fail "Не удалось обновить /etc/fstab."
+  TRANSACTION_TEMP_FSTAB=""
+  TRANSACTION_FSTAB_CHANGED=1
+  restorecon /etc/fstab >/dev/null ||
+    fail "Не удалось восстановить SELinux-контекст /etc/fstab."
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  echo -e "Удаляем пустой LVM-том ${GREEN}${HOME_LV}${WHITE}"
+  lvremove -y "$HOME_LV" >/dev/null ||
+    fail "Не удалось удалить LVM-том /home."
+
+  print_section "Расширение корневой файловой системы"
+  echo -e "Расширяем корневой LVM-том ${GREEN}${ROOT_LV}${WHITE}"
+  lvextend -l +100%FREE "$ROOT_LV" >/dev/null ||
+    fail "Не удалось расширить root LV. Выполните: lvextend -l +100%FREE ${ROOT_LV}"
+
+  echo -e "Расширяем корневую файловую систему ${GREEN}XFS${WHITE}"
+  xfs_growfs / >/dev/null ||
+    fail "Root LV расширен, но XFS не увеличена. Выполните: xfs_growfs /"
+
+  print_section "Проверка новой конфигурации"
+  mkdir -p /home ||
+    fail "Не удалось создать каталог /home внутри корневой файловой системы."
+  restorecon -RF /home >/dev/null ||
+    fail "Не удалось восстановить SELinux-контекст /home."
+
+  echo "Проверяем размер корневого LVM-тома"
+  final_root_size="$(get_lv_size_bytes "$ROOT_LV")"
+  [[ "$final_root_size" =~ ^[0-9]+$ ]] ||
+    fail "Не удалось проверить итоговый размер root LV."
+  [[ "$final_root_size" -ge "$EXPECTED_ROOT_SIZE_BYTES" ]] ||
+    fail "Root LV расширен не до ожидаемого размера."
+
+  echo "Проверяем файл /etc/fstab"
+  findmnt --verify >/dev/null ||
+    fail "Итоговая проверка /etc/fstab завершилась ошибкой."
+
+  echo "Проверяем монтирование файловых систем"
+  mount -a ||
+    fail "Не удалось применить итоговую конфигурацию /etc/fstab командой mount -a."
+  ! mountpoint -q /home ||
+    fail "/home по-прежнему является отдельной точкой монтирования."
+
+  echo -e "${GREEN}Все проверки пройдены успешно.${WHITE}"
+  TRANSACTION_ACTIVE=0
+
+  print_section "Операция завершена"
+  echo
+  echo "Пустой отдельный /home удален."
+  echo "Освободившееся место передано корневой файловой системе."
+  echo
+  echo -e "Текущий размер root LV: ${GREEN}$(human_size "$final_root_size")${WHITE}"
+  echo -e "Резервная копия /etc/fstab: ${GREEN}${TRANSACTION_FSTAB_BACKUP}${WHITE}"
+  echo -e "Резервная копия метаданных LVM: ${GREEN}${vg_backup}${WHITE}"
+  echo
+  lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+  echo
+  df -hT /
+
+  print_section "Перезагрузка"
+  echo "Изменения уже применены, а файл /etc/fstab проверен командами"
+  echo "findmnt --verify и mount -a."
+  echo
+  echo "Однако окончательно убедиться, что сервер успешно загружается"
+  echo "без удаленного LVM-тома /home, можно только после перезагрузки."
+  echo
+  vertical_menu "current" 2 0 5 default=1 nomouse \
+    "Завершить без перезагрузки" \
+    "Перезагрузить сервер сейчас"
+  reboot_choice=$?
+
+  if [[ "$reboot_choice" -ne 1 ]]; then
+    echo "Сервер не перезагружен. Окончательная проверка загрузки отложена."
+    return 0
+  fi
+
+  findmnt --verify >/dev/null ||
+    fail "Перед перезагрузкой обнаружена ошибка в /etc/fstab."
+
+  echo
+  echo -e "Конфигурация проверена. Сервер будет ${GREEN}перезагружен${WHITE}."
+  systemctl reboot ||
+    fail "Не удалось перезагрузить сервер. Выполните команду: systemctl reboot"
+}
+
+main() {
+  [[ "$#" -eq 0 ]] || {
+    echo "Использование: /root/fix.sh"
+    exit 2
+  }
+
+  [[ -t 0 && -t 1 ]] ||
+    fail "Скрипт необходимо запускать в интерактивном терминале."
+
+  collect_and_validate_layout
+  print_explanation_and_plan
+
+  if ! confirm_operation; then
+    wait_for_enter
+    return 0
+  fi
+
+  apply_changes
+}
+
+main "$@"
