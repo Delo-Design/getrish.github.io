@@ -1,0 +1,1404 @@
+#!/usr/bin/env bash
+# RISH: clean AlmaLinux 10 installation on a Selectel VDS, prepared in Rescue.
+# Download this file, then run it with bash in an interactive SSH session.
+# The menu library below is an embedded copy of windows.sh (indentation normalized).
+# Installer preparation never formats a disk or reboots the VPS itself.
+# Source this file to test the parsing/rendering functions without running main.
+
+SI_VERSION='1.0.3'
+# Select an available AlmaLinux 10.x release; installer checksums come from .treeinfo.
+SI_ALMA_VERSION='10.2'
+SI_REPO_ROOT='https://repo.almalinux.org/almalinux'
+SI_BASE_URL="${SI_REPO_ROOT}/${SI_ALMA_VERSION}"
+SI_REPO="${SI_BASE_URL}/BaseOS/x86_64/os"
+SI_APPSTREAM="${SI_BASE_URL}/AppStream/x86_64/os"
+SI_KERNEL_SHA=''
+SI_INITRD_SHA=''
+SI_BOOT_DIR='/boot/rish-alma-install'
+SI_TMP=''
+SI_LOG=''
+SI_MNT=''
+SI_STAGE=''
+SI_FINAL_CREATED=0
+SI_CUSTOM_CREATED=0
+SI_MOUNTED=0
+SI_SUCCESS=0
+SI_LOCKED=0
+SI_LOCK='/tmp/rish-selectel-alma.lock'
+SI_ROOT_HASH=''
+SI_KEYS_B64=''
+SI_KEYS_SHA='-'
+SI_KEYS_BYTES=0
+
+si_message() {
+    local label=$1 color=$2
+    shift 2
+    if [[ -t 1 ]]; then
+        printf '\033[%sm%s\033[0m %s\n' "$color" "$label" "$*"
+    else
+        printf '%s %s\n' "$label" "$*"
+    fi
+    if [[ -n $SI_LOG ]]; then
+        printf '%s %s\n' "$label" "$*" >> "$SI_LOG"
+    fi
+}
+si_info() { si_message '[..]' '36' "$@"; }
+si_ok() { si_message '[ok]' '32' "$@"; }
+si_warn() { si_message '[!]' '33' "$@"; }
+si_fail() { si_message '[ошибка]' '31' "$@" >&2; return 1; }
+
+si_help() {
+    printf 'RISH: установка AlmaLinux %s на VPS/VDS Selectel через Rescue\n' "$SI_ALMA_VERSION"
+    cat <<'HELP'
+
+bash selectel_almalinux.sh           Меню подготовки и проверки AlmaLinux
+bash selectel_almalinux.sh --check   Только проверка, без записи на диск CentOS
+bash selectel_almalinux.sh --verify  Проверка уже установленной этим скриптом AlmaLinux
+bash selectel_almalinux.sh --help    Эта справка
+
+Подготовка поддерживает: один диск GPT, BIOS, CentOS Stream 9 на ext4,
+исходный /boot внутри корневого раздела, один IPv4-интерфейс и обычный шлюз
+в той же подсети. Нужен тариф от 4 ГиБ RAM и диск от 10 ГиБ.
+Несовместимая или неоднозначная конфигурация останавливает подготовку.
+
+Разметка новой системы: BIOS Boot 2 МиБ, /boot 1 ГиБ, остальное — / (XFS).
+Отдельных /home, LVM и swap не будет. Данные выбранного диска будут удалены
+установщиком после выхода из Rescue. Скрипт сам не перезагружает сервер.
+
+После успешной подготовки: «Выйти из rescue» в панели Selectel.
+В течение 10 секунд GRUB автоматически выберет установку AlmaLinux.
+SSH-сеанс Rescue завершится; наблюдайте за установкой в консоли панели.
+HELP
+}
+
+si_alma_version_valid() {
+    [[ $1 =~ ^10\.(0|[1-9][0-9]*)$ ]]
+}
+si_ipv4_valid() {
+    local value=$1 a b c d extra octet
+    [[ $value =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r a b c d extra <<< "$value"
+    [[ -z $extra ]] || return 1
+    for octet in "$a" "$b" "$c" "$d"; do
+        [[ ${#octet} -le 3 && ( $octet == 0 || $octet != 0* ) ]] || return 1
+        ((10#$octet <= 255)) || return 1
+    done
+}
+si_ipv4_number() {
+    local a b c d
+    si_ipv4_valid "$1" || return 1
+    IFS=. read -r a b c d <<< "$1"
+    printf '%u\n' "$(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))"
+}
+si_unicast_valid() {
+    local first
+    si_ipv4_valid "$1" || return 1
+    first=${1%%.*}
+    ((first > 0 && first < 224 && first != 127))
+}
+si_hostname_valid() {
+    local name=$1 label
+    local -a labels
+    [[ ${#name} -le 253 && $name != *..* && $name != .* && $name != *. ]] || return 1
+    IFS=. read -r -a labels <<< "$name"
+    ((${#labels[@]} > 0)) || return 1
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 && $label =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+    done
+}
+si_os_value() {
+    # Read a data file; never source an os-release file from the target disk.
+    awk -v key="$2" '
+        index($0, key "=") == 1 {
+            value=substr($0, length(key)+2)
+            if (value ~ /^".*"$/) value=substr(value,2,length(value)-2)
+            else if (value ~ /^\047.*\047$/) value=substr(value,2,length(value)-2)
+            print value
+            exit
+        }' "$1"
+}
+si_target_file() {
+    local path
+    path=$(readlink -f "$SI_MNT/$1") || return 1
+    [[ $path == "$SI_MNT/"* && -f $path ]] || return 1
+    printf '%s\n' "$path"
+}
+si_mount_ro() {
+    mount -t ext4 -o ro,noload "$1" "$SI_MNT" || return 1
+    SI_MOUNTED=1
+}
+si_unmount() {
+    if ((SI_MOUNTED)); then
+        umount "$SI_MNT" || { si_fail "Не удалось размонтировать $SI_MNT. Не выходите из Rescue."; return 1; }
+        SI_MOUNTED=0
+    fi
+}
+si_rollback() {
+    local final="$SI_MNT$SI_BOOT_DIR" custom="$SI_MNT/boot/grub2/custom.cfg"
+    if ((SI_CUSTOM_CREATED)); then
+        if [[ -f $custom && ! -L $custom && $custom -ef "$final/custom.cfg" ]]; then
+            rm -f -- "$custom" || return 1
+        elif [[ -e $custom || -L $custom ]]; then
+            si_fail "custom.cfg изменён извне. Оставлены файлы подготовки; проверьте $custom."
+            return 1
+        fi
+        SI_CUSTOM_CREATED=0
+    fi
+    if ((SI_FINAL_CREATED)); then
+        rm -rf -- "$final" || return 1
+        SI_FINAL_CREATED=0
+    fi
+    if [[ -n $SI_STAGE && $SI_STAGE == "$SI_MNT/boot/.rish-alma."* ]]; then
+        rm -rf -- "$SI_STAGE" || return 1
+        SI_STAGE=''
+    fi
+    sync
+}
+si_cleanup() {
+    local code=$?
+    trap - EXIT HUP INT TERM
+    if [[ -n $SI_MNT ]] && ((SI_MOUNTED)); then
+        if ((!SI_SUCCESS)) && ((SI_FINAL_CREATED || SI_CUSTOM_CREATED || ${#SI_STAGE})); then
+            if ! si_rollback; then
+                si_warn "Автоматическая отмена подготовки не завершена. Не перезагружайте VPS."
+                code=1
+            fi
+        fi
+        if ! si_unmount; then
+            code=1
+        fi
+    fi
+    if ((!SI_SUCCESS && SI_CUSTOM_CREATED && !SI_MOUNTED)); then
+        si_warn "Пункт установки мог сохраниться на размонтированном диске. До перезапуска проверьте /boot/grub2/custom.cfg через Rescue."
+        code=1
+    fi
+    SI_ROOT_HASH=''
+    SI_KEYS_B64=''
+    if [[ -n $SI_TMP && $SI_TMP == /tmp/rish-alma.* ]] && ((!SI_MOUNTED)); then
+        rm -rf -- "$SI_TMP"
+    fi
+    if ((SI_LOCKED)); then
+        rm -f -- "$SI_LOCK/pid"
+        rmdir "$SI_LOCK" 2>/dev/null || true
+    fi
+    if [[ -n $SI_LOG ]]; then
+        printf '\nЖурнал скрипта: %s\n' "$SI_LOG"
+    fi
+    exit "$code"
+}
+si_runtime_init() {
+    if [[ $(uname -s) != Linux ]] || ((EUID != 0)); then
+        si_fail "Запустите скрипт на VPS в Linux от root."
+        return 1
+    fi
+    umask 077
+    if ! mkdir -m 700 "$SI_LOCK" 2>/dev/null; then
+        si_fail "Другой запуск или незавершённая работа: $SI_LOCK. Проверьте процесс из файла pid."
+        return 1
+    fi
+    SI_LOCKED=1
+    trap si_cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf '%s\n' "$$" > "$SI_LOCK/pid" || return 1
+    SI_TMP=$(mktemp -d /tmp/rish-alma.XXXXXX) || return 1
+    SI_LOG=$(mktemp /tmp/rish-selectel-alma.log.XXXXXX) || return 1
+    SI_MNT="$SI_TMP/centos"
+    mkdir -m 700 "$SI_MNT" || return 1
+}
+si_require() {
+    local tool
+    for tool in "$@"; do
+        command -v "$tool" >/dev/null 2>&1 || { si_fail "В окружении отсутствует команда: $tool"; return 1; }
+    done
+}
+si_platform() {
+    local fs memtotal
+    [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || { si_fail "Поддерживается Linux x86_64 в Rescue Selectel."; return 1; }
+    ((EUID == 0)) || { si_fail "Запустите скрипт от root."; return 1; }
+    [[ ! -d /sys/firmware/efi ]] || { si_fail "Обнаружен UEFI. Эта версия скрипта рассчитана на BIOS."; return 1; }
+    fs=$(awk '$2 == "/" { fs=$3 } END { print fs }' /proc/mounts)
+    case "$fs" in
+        rootfs|tmpfs|ramfs|overlay|squashfs) ;;
+        *) si_fail "Корень работающей системы — $fs. Сначала загрузите VPS в Rescue."; return 1 ;;
+    esac
+    memtotal=$(awk '$1 == "MemTotal:" {print $2}' /proc/meminfo)
+    if [[ ! $memtotal =~ ^[0-9]+$ ]] || ((memtotal < 3145728)); then
+        si_fail "Для установки по HTTPS нужно минимум 3 ГиБ видимой RAM. Выберите тариф от 4 ГиБ."
+        return 1
+    fi
+    si_require awk sed grep tr cat cp mv rm ln mkdir rmdir chmod mktemp \
+        mount umount sync ip blkid readlink basename dirname dd od wc \
+        curl sha256sum gzip cpio chroot bash base64 df cmp date stty sleep
+}
+si_disk_candidates() {
+    local path name
+    for path in /sys/class/block/*; do
+        [[ -e $path && ! -f $path/partition ]] || continue
+        name=${path##*/}
+        [[ $name =~ ^(sd[a-z]+|vd[a-z]+|nvme[0-9]+n[0-9]+)$ ]] || continue
+        [[ -b /dev/$name ]] || continue
+        printf '%s\n' "$name"
+    done
+}
+si_disk_parts() {
+    local path parent
+    for path in /sys/class/block/*; do
+        [[ -f $path/partition ]] || continue
+        parent=$(basename "$(dirname "$(readlink -f "$path")")") || return 1
+        [[ $parent == "$1" ]] && printf '/dev/%s\n' "${path##*/}"
+    done
+    return 0
+}
+si_assert_unused() {
+    local source rest resolved device holder path mounted_ids device_id
+    local -a devices=("/dev/$SI_DISK" "${SI_PARTS[@]}")
+    mounted_ids=$(awk '{print $3}' /proc/self/mountinfo) ||
+        { si_fail "Не удалось прочитать список смонтированных устройств."; return 1; }
+    for device in "${devices[@]}"; do
+        device_id=$(cat "/sys/class/block/${device##*/}/dev") || return 1
+        [[ $device_id =~ ^[0-9]+:[0-9]+$ ]] || return 1
+        if grep -Fxq "$device_id" <<< "$mounted_ids"; then
+            si_fail "$device уже смонтирован (устройство $device_id). Сначала освободите его."
+            return 1
+        fi
+    done
+    while read -r source rest; do
+        [[ $source == /dev/* ]] || continue
+        resolved=$(readlink -f "$source") || return 1
+        for device in "${devices[@]}"; do
+            [[ $resolved != "$device" ]] ||
+                { si_fail "$device уже смонтирован или используется как swap. Сначала освободите его."; return 1; }
+        done
+    done < <(cat /proc/mounts /proc/swaps)
+    for device in "${devices[@]}"; do
+        path="/sys/class/block/${device##*/}/holders"
+        for holder in "$path"/*; do
+            [[ ! -e $holder ]] ||
+                { si_fail "$device используется другим блочным устройством."; return 1; }
+        done
+    done
+}
+si_gpt_valid() {
+    local sector=$2 magic
+    [[ $sector == 512 || $sector == 4096 ]] || return 1
+    magic=$(dd if="$1" bs="$sector" skip=1 count=1 2>/dev/null | od -An -tx1 -N8 | tr -d ' \n') || return 1
+    [[ $magic == 4546492050415254 ]]
+}
+si_find_target() {
+    local part file id version name sector count
+    local -a disks=() matches=()
+    while IFS= read -r name; do [[ -n $name ]] && disks+=("$name"); done < <(si_disk_candidates)
+    ((${#disks[@]} == 1)) ||
+        { si_fail "Ожидается ровно один системный диск; найдено: ${#disks[@]}. Автовыбор отменён."; return 1; }
+    SI_DISK=${disks[0]}
+    SI_PARTS=()
+    while IFS= read -r part; do [[ -n $part ]] && SI_PARTS+=("$part"); done < <(si_disk_parts "$SI_DISK")
+    ((${#SI_PARTS[@]} > 0)) || { si_fail "На /dev/$SI_DISK не найдены разделы CentOS."; return 1; }
+    si_assert_unused || return 1
+    sector=$(cat "/sys/class/block/$SI_DISK/queue/logical_block_size") || return 1
+    si_gpt_valid "/dev/$SI_DISK" "$sector" || { si_fail "На диске ожидается таблица GPT."; return 1; }
+    count=$(cat "/sys/class/block/$SI_DISK/size") || return 1
+    [[ $count =~ ^[0-9]+$ ]] || return 1
+    SI_DISK_BYTES=$((count * 512))
+    ((SI_DISK_BYTES >= 10737418240)) || { si_fail "Диск меньше 10 ГиБ."; return 1; }
+    si_info "Ищу CentOS Stream 9 на /dev/$SI_DISK; разделы читаются без записи."
+    for part in "${SI_PARTS[@]}"; do
+        blkid "$part" | grep -Fq 'TYPE="ext4"' || continue
+        si_mount_ro "$part" || { si_fail "Не удалось прочитать $part."; return 1; }
+        file=$(si_target_file etc/os-release) || file=''
+        if [[ -n $file ]]; then
+            id=$(si_os_value "$file" ID)
+            version=$(si_os_value "$file" VERSION_ID)
+            name=$(si_os_value "$file" NAME)
+            if [[ $id == centos && $version == 9 && $name == 'CentOS Stream' ]]; then
+                matches+=("$part")
+            fi
+        fi
+        si_unmount || return 1
+    done
+    ((${#matches[@]} == 1)) ||
+        { si_fail "Нужен один корневой раздел CentOS Stream 9 на ext4; найдено: ${#matches[@]}."; return 1; }
+    SI_ROOT_PART=${matches[0]}
+    si_mount_ro "$SI_ROOT_PART" || return 1
+    SI_ROOT_UUID=$(blkid "$SI_ROOT_PART" | sed -n 's/.* UUID="\([^"]*\)".*/\1/p') || return 1
+    [[ $SI_ROOT_UUID =~ ^[0-9a-fA-F-]+$ ]] || { si_fail "Не найден UUID исходной файловой системы."; return 1; }
+}
+si_check_target() {
+    local file path available loader cpu
+    for path in boot boot/grub2; do
+        [[ -d $SI_MNT/$path && ! -L $SI_MNT/$path ]] ||
+            { si_fail "Ожидается обычный каталог /$path внутри раздела CentOS."; return 1; }
+    done
+    file=$(si_target_file etc/fstab) || { si_fail "Не найден fstab CentOS."; return 1; }
+    if awk '$0 !~ /^[[:space:]]*#/ && ($2 == "/boot" || $2 == "/boot/efi") { found=1 } END {exit !found}' "$file"; then
+        si_fail "У CentOS отдельный /boot или /boot/efi. Эта разметка не поддерживается."
+        return 1
+    fi
+    file="$SI_MNT/boot/grub2/grub.cfg"
+    if [[ ! -f $file || -L $file ]] || ! grep -Eq '^[[:space:]]*source[[:space:]]+.*custom[.]cfg' "$file"; then
+        si_fail "GRUB CentOS не подключает /boot/grub2/custom.cfg."
+        return 1
+    fi
+    for path in /boot/grub2/custom.cfg "$SI_BOOT_DIR" /boot/alma-install; do
+        [[ ! -e $SI_MNT$path && ! -L $SI_MNT$path ]] ||
+            { si_fail "$path уже существует. Подготовка отменена; существующие файлы не перезаписаны."; return 1; }
+    done
+    loader=/lib64/ld-linux-x86-64.so.2
+    cpu=$(LC_ALL=C chroot "$SI_MNT" "$loader" --help 2>&1) || { si_fail "Не удалось проверить процессор загрузчиком CentOS."; return 1; }
+    grep -Eq 'x86-64-v3.*supported' <<< "$cpu" || { si_fail "Процессор не поддерживает x86-64-v3."; return 1; }
+    [[ -x $SI_MNT/usr/bin/grub2-script-check ]] || { si_fail "В CentOS отсутствует grub2-script-check."; return 1; }
+    available=$(df -Pk "$SI_MNT" | awk 'NR==2 {print $4}') || return 1
+    if [[ ! $available =~ ^[0-9]+$ ]] || ((available < 1048576)); then
+        si_fail "В исходной файловой системе нужно не менее 1 ГиБ свободного места."
+        return 1
+    fi
+    file=$(si_target_file etc/hostname) || { si_fail "Не найдено имя сервера в CentOS."; return 1; }
+    SI_HOST=$(cat "$file")
+    si_hostname_valid "$SI_HOST" || { si_fail "Имя сервера должно быть корректным DNS-именем латиницей."; return 1; }
+    si_ok "CentOS Stream 9, GPT, BIOS, ext4 и процессор x86-64-v3 проверены."
+}
+si_parse_routes() {
+    local line token prev gateway dev count=0
+    SI_IFACE=''
+    SI_GATEWAY=''
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        gateway='' dev='' prev=''
+        [[ $line == default\ * ]] || return 1
+        # Route output is treated as data. Globbing is never used to split it.
+        local -a fields
+        read -r -a fields <<< "$line"
+        for token in "${fields[@]}"; do
+            [[ $prev != via ]] || gateway=$token
+            [[ $prev != dev ]] || dev=$token
+            prev=$token
+        done
+        si_unicast_valid "$gateway" || return 1
+        [[ $dev =~ ^[a-zA-Z0-9_.-]+$ && $dev != lo ]] || return 1
+        SI_GATEWAY=$gateway
+        SI_IFACE=$dev
+        ((count += 1))
+    done
+    ((count == 1))
+}
+si_check_subnet() {
+    local ip gateway mask broadcast
+    [[ $SI_PREFIX =~ ^([1-9]|[12][0-9]|30)$ ]] || return 1
+    si_unicast_valid "$SI_IP" && si_unicast_valid "$SI_GATEWAY" || return 1
+    ip=$(si_ipv4_number "$SI_IP") || return 1
+    gateway=$(si_ipv4_number "$SI_GATEWAY") || return 1
+    mask=$(( (0xffffffff << (32 - SI_PREFIX)) & 0xffffffff ))
+    broadcast=$(( (ip & mask) | (0xffffffff ^ mask) ))
+    (( (ip & mask) == (gateway & mask) && ip != gateway &&
+        ip != (ip & mask) && ip != broadcast &&
+        gateway != (ip & mask) && gateway != broadcast )) || return 1
+    SI_NETMASK=$(printf '%d.%d.%d.%d' "$(( (mask >> 24) & 255 ))" \
+        "$(( (mask >> 16) & 255 ))" "$(( (mask >> 8) & 255 ))" "$((mask & 255))")
+}
+si_network() {
+    local routes output cidr value existing seen path
+    local -a addresses=() nics=()
+    for path in /sys/class/net/*; do
+        [[ -e $path/device ]] && nics+=("${path##*/}")
+    done
+    ((${#nics[@]} == 1)) || { si_fail "Ожидается один сетевой адаптер; найдено: ${#nics[@]}."; return 1; }
+    routes=$(ip -4 route show default) || return 1
+    si_parse_routes <<< "$routes" || { si_fail "Нужен ровно один маршрут default via ШЛЮЗ dev ИНТЕРФЕЙС."; return 1; }
+    [[ $SI_IFACE == "${nics[0]}" ]] || { si_fail "Маршрут идёт через виртуальное/составное подключение."; return 1; }
+    output=$(ip -4 address show dev "$SI_IFACE") || return 1
+    while IFS= read -r cidr; do [[ -n $cidr ]] && addresses+=("$cidr"); done < <(awk '$1=="inet" {print $2}' <<< "$output")
+    ((${#addresses[@]} == 1)) || { si_fail "На адаптере должен быть один IPv4."; return 1; }
+    cidr=${addresses[0]}
+    [[ $cidr == */* ]] || return 1
+    SI_IP=${cidr%/*}
+    SI_PREFIX=${cidr#*/}
+    si_check_subnet || { si_fail "Нужен IPv4 с префиксом /1…/30 и обычный шлюз в той же подсети."; return 1; }
+    SI_MAC=$(tr '[:upper:]' '[:lower:]' < "/sys/class/net/$SI_IFACE/address") || return 1
+    [[ $SI_MAC =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ && $SI_MAC != 00:00:00:00:00:00 ]] || return 1
+    SI_DNS=()
+    while IFS= read -r value; do
+        si_unicast_valid "$value" || continue
+        seen=0
+        for existing in "${SI_DNS[@]}"; do [[ $existing != "$value" ]] || seen=1; done
+        ((seen)) || SI_DNS+=("$value")
+    done < <(awk '$1=="nameserver" {print $2}' /etc/resolv.conf)
+    ((${#SI_DNS[@]} > 0)) || { si_fail "В Rescue не найдены внешние IPv4 DNS-серверы в /etc/resolv.conf."; return 1; }
+    SI_DNS_CSV=$(IFS=,; printf '%s' "${SI_DNS[*]}")
+    SI_DNS_INI=$(printf '%s;' "${SI_DNS[@]}")
+    SI_DNS_BOOT=''
+    for value in "${SI_DNS[@]}"; do SI_DNS_BOOT+=" nameserver=$value"; done
+    si_ok "Параметры работающей сети Rescue определены."
+}
+si_access() {
+    local file
+    file=$(si_target_file etc/shadow) || { si_fail "Не найден shadow CentOS."; return 1; }
+    SI_ROOT_HASH=$(awk -F: '$1=="root" {print $2; exit}' "$file")
+    [[ $SI_ROOT_HASH =~ ^\$(6|y)\$[a-zA-Z0-9./\$=]+$ ]] ||
+        { si_fail "У root должен быть активный пароль SHA-512/yescrypt. Разблокируйте его в CentOS до подготовки."; return 1; }
+    SI_KEYS_B64=''
+    SI_KEYS_SHA='-'
+    SI_KEYS_BYTES=0
+    if [[ -e $SI_MNT/root/.ssh/authorized_keys || -L $SI_MNT/root/.ssh/authorized_keys ]]; then
+        file=$(si_target_file root/.ssh/authorized_keys) ||
+            { si_fail "authorized_keys ссылается за пределы диска CentOS."; return 1; }
+        SI_KEYS_BYTES=$(wc -c < "$file")
+        ((SI_KEYS_BYTES <= 65536)) || { si_fail "authorized_keys больше 64 КиБ; нужна отдельная проверка."; return 1; }
+        if ((SI_KEYS_BYTES > 0)); then
+            SI_KEYS_SHA=$(sha256sum "$file" | awk '{print $1}') || return 1
+            SI_KEYS_B64=$(base64 < "$file" | tr -d '\n') || return 1
+        fi
+    fi
+    SI_NM_UUID=$(cat /proc/sys/kernel/random/uuid) || return 1
+    [[ $SI_NM_UUID =~ ^[0-9a-f-]{36}$ ]] || return 1
+    si_ok "Хеш пароля root прочитан. authorized_keys будет перенесён целиком ($SI_KEYS_BYTES байт)."
+}
+si_recheck_access() {
+    local expected_hash=$SI_ROOT_HASH expected_keys=$SI_KEYS_SHA
+    si_access || return 1
+    if [[ $SI_ROOT_HASH != "$expected_hash" || $SI_KEYS_SHA != "$expected_keys" ]]; then
+        si_fail "После открытия диска для записи изменились данные доступа root. Повторите проверку; установка не подготовлена."
+        return 1
+    fi
+}
+si_download() {
+    if curl --fail --location --show-error --silent --proto '=https' --proto-redir '=https' \
+        --connect-timeout 20 --max-time 1800 --retry 3 --retry-delay 2 "$1" -o "$2" 2> "$SI_TMP/download.err"; then
+        return 0
+    fi
+    si_fail "Не удалось скачать $1"
+    cat "$SI_TMP/download.err" >&2
+    [[ -z $SI_LOG ]] || cat "$SI_TMP/download.err" >> "$SI_LOG"
+    return 1
+}
+si_treeinfo_value() {
+    # Parse INI data without executing it; require one section and one matching key.
+    LC_ALL=C awk -v wanted_section="$2" -v wanted_key="$3" '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        {
+            line=trim($0)
+            if (line == "" || line ~ /^[#;]/) next
+            if (line ~ /^\[[^][]+\]$/) {
+                section=trim(substr(line, 2, length(line)-2))
+                if (section == wanted_section) sections++
+                next
+            }
+            if (section != wanted_section) next
+            separator=index(line, "=")
+            if (!separator) { invalid=1; next }
+            key=trim(substr(line, 1, separator-1))
+            if (key == wanted_key) {
+                matches++
+                value=trim(substr(line, separator+1))
+            }
+        }
+        END {
+            if (invalid || sections != 1 || matches != 1 || value == "") exit 1
+            print value
+        }' "$1"
+}
+si_treeinfo_load() {
+    local version arch family general_version general_arch general_family kernel initrd image_kernel image_initrd
+    SI_KERNEL_SHA=''
+    SI_INITRD_SHA=''
+    si_alma_version_valid "$SI_ALMA_VERSION" ||
+        { si_fail "SI_ALMA_VERSION должен задавать выпуск AlmaLinux в формате 10.N."; return 1; }
+    if ! { version=$(si_treeinfo_value "$1" release version) &&
+        arch=$(si_treeinfo_value "$1" tree arch) &&
+        family=$(si_treeinfo_value "$1" release name) &&
+        general_version=$(si_treeinfo_value "$1" general version) &&
+        general_arch=$(si_treeinfo_value "$1" general arch) &&
+        general_family=$(si_treeinfo_value "$1" general family); }; then
+        si_fail "В .treeinfo отсутствуют однозначные поля версии, архитектуры или дистрибутива."
+        return 1
+    fi
+    # AlmaLinux may publish only the major version in a minor release tree.
+    [[ $family == AlmaLinux && $general_family == "$family" &&
+        $arch == x86_64 && $general_arch == "$arch" && $general_version == "$version" &&
+        ( $version == "$SI_ALMA_VERSION" || $version == "${SI_ALMA_VERSION%%.*}" ) ]] ||
+        { si_fail "Метаданные .treeinfo не соответствуют AlmaLinux $SI_ALMA_VERSION x86_64."; return 1; }
+    if ! { image_kernel=$(si_treeinfo_value "$1" images-x86_64 kernel) &&
+        image_initrd=$(si_treeinfo_value "$1" images-x86_64 initrd); }; then
+        si_fail "В .treeinfo отсутствуют однозначные пути ядра и initrd для x86_64."
+        return 1
+    fi
+    [[ $image_kernel == images/pxeboot/vmlinuz && $image_initrd == images/pxeboot/initrd.img ]] ||
+        { si_fail "Структура установочного дерева изменилась: проверьте пути ядра и initrd в .treeinfo."; return 1; }
+    if ! { kernel=$(si_treeinfo_value "$1" checksums "$image_kernel") &&
+        initrd=$(si_treeinfo_value "$1" checksums "$image_initrd"); }; then
+        si_fail "В разделе checksums отсутствуют однозначные суммы ядра и initrd."
+        return 1
+    fi
+    [[ $kernel =~ ^sha256:[0-9a-fA-F]{64}$ && $initrd =~ ^sha256:[0-9a-fA-F]{64}$ ]] ||
+        { si_fail "В .treeinfo ожидаются контрольные суммы SHA-256 из 64 шестнадцатеричных символов."; return 1; }
+    kernel=$(printf '%s' "${kernel#sha256:}" | LC_ALL=C tr '[:upper:]' '[:lower:]') || return 1
+    initrd=$(printf '%s' "${initrd#sha256:}" | LC_ALL=C tr '[:upper:]' '[:lower:]') || return 1
+    SI_KERNEL_SHA=$kernel
+    SI_INITRD_SHA=$initrd
+}
+si_source_check() {
+    SI_KERNEL_SHA=''
+    SI_INITRD_SHA=''
+    si_info "Проверяю HTTPS и установочное дерево AlmaLinux $SI_ALMA_VERSION."
+    si_download "$SI_REPO/.treeinfo" "$SI_TMP/treeinfo" ||
+        { si_fail "Не удалось получить .treeinfo. Проверьте сеть, DNS и время в Rescue."; return 1; }
+    si_treeinfo_load "$SI_TMP/treeinfo" || return 1
+    si_ok "Источник доступен, метаданные проверены, SHA-256 ядра и initrd получены из .treeinfo."
+}
+si_plan() {
+    printf '\nAlmaLinux %s — план чистой установки\n\n' "$SI_ALMA_VERSION"
+    printf 'Диск:        /dev/%s (%s байт)\n' "$SI_DISK" "$SI_DISK_BYTES"
+    printf 'CentOS:      %s, UUID %s\n' "$SI_ROOT_PART" "$SI_ROOT_UUID"
+    printf 'IPv4:        %s/%s\nШлюз:        %s\nDNS:         %s\n' "$SI_IP" "$SI_PREFIX" "$SI_GATEWAY" "$SI_DNS_CSV"
+    printf 'Адаптер:     %s, MAC %s\nИмя сервера: %s\n' "$SI_IFACE" "$SI_MAC" "$SI_HOST"
+    printf 'Доступ:      прежний пароль root; authorized_keys — %s байт\n' "$SI_KEYS_BYTES"
+    printf '\nРазметка: BIOS Boot 2 МиБ, /boot 1 ГиБ, всё остальное — / (XFS).\n'
+    printf 'Отдельных /home, LVM и swap не будет.\n\n'
+    si_warn "После выхода из Rescue установщик удалит ВСЕ разделы и данные /dev/$SI_DISK."
+}
+si_render_kickstart() {
+    cat <<KICKSTART
+#version=RHEL10
+text --non-interactive
+lang en_US.UTF-8
+keyboard --xlayouts=us
+timezone UTC --utc
+url --url=$SI_REPO/
+repo --name=AppStream --baseurl=$SI_APPSTREAM/
+rootpw --iscrypted --allow-ssh $SI_ROOT_HASH
+network --device=$SI_MAC --bindto=mac --bootproto=static --ip=$SI_IP --netmask=$SI_NETMASK --gateway=$SI_GATEWAY --nameserver=$SI_DNS_CSV --hostname=$SI_HOST --onboot=yes --activate
+firewall --enabled --service=ssh
+selinux --enforcing
+services --enabled=NetworkManager,sshd,qemu-guest-agent
+firstboot --disable
+ignoredisk --only-use=$SI_DISK
+zerombr
+clearpart --all --initlabel --disklabel=gpt --drives=$SI_DISK
+bootloader --location=mbr --boot-drive=$SI_DISK --append="console=ttyS0,115200n8 console=tty0"
+part biosboot --fstype=biosboot --size=2 --ondisk=$SI_DISK
+part /boot --fstype=xfs --size=1024 --ondisk=$SI_DISK
+part / --fstype=xfs --size=1024 --grow --ondisk=$SI_DISK
+reboot
+
+%packages
+@^minimal-environment
+NetworkManager
+openssh-server
+qemu-guest-agent
+%end
+
+%pre --interpreter=/bin/bash --erroronfail --log=/tmp/alma-preflight.log
+set -euo pipefail
+test "\$(blockdev --getsize64 /dev/$SI_DISK)" = "$SI_DISK_BYTES"
+test "\$(blkid -s UUID -o value $SI_ROOT_PART)" = "$SI_ROOT_UUID"
+test "\$(cat /sys/class/net/install0/address)" = "$SI_MAC"
+test ! -d /sys/firmware/efi
+test "\$(lsblk -dn -o TYPE | grep -c '^disk\$')" = 1
+ip -4 address show dev install0 | grep -F "inet $SI_IP/$SI_PREFIX "
+ip -4 route show default | grep -F "via $SI_GATEWAY "
+printf '%s\n' 'Disk, BIOS and network checks passed.'
+%end
+
+%post --interpreter=/bin/bash --erroronfail --log=/root/alma-install-post.log
+set -euo pipefail
+install -d -m 700 /root/installer-network-profiles
+for profile in /etc/NetworkManager/system-connections/*.nmconnection; do
+    test -f "\$profile" || continue
+    mv "\$profile" /root/installer-network-profiles/
+done
+cat > /etc/NetworkManager/system-connections/selectel-static.nmconnection <<'NETWORK_PROFILE'
+[connection]
+id=selectel-static
+uuid=$SI_NM_UUID
+type=ethernet
+autoconnect=true
+autoconnect-priority=100
+
+[ethernet]
+mac-address=$SI_MAC
+
+[ipv4]
+method=manual
+address1=$SI_IP/$SI_PREFIX,$SI_GATEWAY
+dns=$SI_DNS_INI
+ignore-auto-dns=true
+may-fail=false
+
+[ipv6]
+method=auto
+addr-gen-mode=stable-privacy
+NETWORK_PROFILE
+chmod 600 /etc/NetworkManager/system-connections/selectel-static.nmconnection
+install -d -m 700 /root/.ssh
+if test "$SI_KEYS_BYTES" -gt 0; then
+    printf '%s' '$SI_KEYS_B64' | base64 -d > /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    printf '%s  %s\n' '$SI_KEYS_SHA' /root/.ssh/authorized_keys | sha256sum -c -
+fi
+test "\$(awk -F: '\$1=="root" {print \$2; exit}' /etc/shadow)" = '$SI_ROOT_HASH'
+restorecon -RF /etc/NetworkManager/system-connections /root/.ssh
+ssh-keygen -A
+/usr/sbin/sshd -t
+test "\$(cat /etc/hostname)" = "$SI_HOST"
+cat > /root/selectel-alma-install.info <<'INSTALL_INFO'
+VERSION=$SI_ALMA_VERSION
+IP=$SI_IP
+PREFIX=$SI_PREFIX
+GATEWAY=$SI_GATEWAY
+DNS=$SI_DNS_CSV
+MAC=$SI_MAC
+HOSTNAME=$SI_HOST
+KEYS_SHA256=$SI_KEYS_SHA
+INSTALL_INFO
+chmod 600 /root/selectel-alma-install.info
+touch /root/alma-clean-install.complete
+printf '%s\n' 'Static networking and root access configured.'
+%end
+KICKSTART
+}
+si_render_grub() {
+    cat <<GRUB
+# Generated by RISH selectel_almalinux.sh $SI_VERSION.
+set default="rish-almalinux10-clean-install"
+set timeout_style=menu
+set timeout=10
+
+menuentry 'Install AlmaLinux $SI_ALMA_VERSION - CLEAN DISK $SI_DISK' --id=rish-almalinux10-clean-install {
+    insmod part_gpt
+    insmod ext2
+    search --no-floppy --fs-uuid --set=root $SI_ROOT_UUID
+    linux $SI_BOOT_DIR/vmlinuz inst.repo=$SI_REPO/ inst.ks=file:/ks.cfg inst.text ifname=install0:$SI_MAC ip=$SI_IP::$SI_GATEWAY:$SI_NETMASK:$SI_HOST:install0:none$SI_DNS_BOOT rd.neednet=1 console=ttyS0,115200n8 console=tty0
+    initrd $SI_BOOT_DIR/initrd.img
+}
+GRUB
+}
+si_prepare() {
+    local final custom path expected_host=$SI_HOST current_uuid
+    final="$SI_MNT$SI_BOOT_DIR"
+    custom="$SI_MNT/boot/grub2/custom.cfg"
+    # Drop the ro,noload mount and mount normally only after confirmation.
+    si_unmount || return 1
+    si_assert_unused || return 1
+    current_uuid=$(blkid "$SI_ROOT_PART" | sed -n 's/.* UUID="\([^"]*\)".*/\1/p') || return 1
+    [[ $current_uuid == "$SI_ROOT_UUID" ]] || { si_fail "UUID раздела изменился после проверки."; return 1; }
+    ip -4 address show dev "$SI_IFACE" | grep -Fq "inet $SI_IP/$SI_PREFIX " || return 1
+    ip -4 route show default | grep -Fq "via $SI_GATEWAY " || return 1
+    [[ $(cat "/sys/class/net/$SI_IFACE/address") == "$SI_MAC" ]] || return 1
+    mount -t ext4 "$SI_ROOT_PART" "$SI_MNT" || return 1
+    SI_MOUNTED=1
+    si_check_target || return 1
+    [[ $SI_HOST == "$expected_host" ]] || { si_fail "Имя сервера изменилось после проверки."; return 1; }
+    si_recheck_access || return 1
+    SI_STAGE=$(mktemp -d "$SI_MNT/boot/.rish-alma.XXXXXX") || return 1
+    mkdir -m 700 "$SI_STAGE/payload" || return 1
+    cp "$SI_TMP/treeinfo" "$SI_STAGE/.treeinfo" || return 1
+    si_info "Скачиваю ядро AlmaLinux."
+    si_download "$SI_REPO/images/pxeboot/vmlinuz" "$SI_STAGE/vmlinuz" || return 1
+    si_info "Скачиваю initrd. Это может занять несколько минут."
+    si_download "$SI_REPO/images/pxeboot/initrd.img" "$SI_STAGE/initrd.original.img" || return 1
+    printf '%s  %s\n' "$SI_KERNEL_SHA" vmlinuz \
+        "$SI_INITRD_SHA" initrd.original.img > "$SI_STAGE/SHA256SUMS" || return 1
+    (cd "$SI_STAGE" && sha256sum -c SHA256SUMS) || { si_fail "Файлы установщика не прошли SHA-256."; return 1; }
+    si_render_kickstart > "$SI_STAGE/payload/ks.cfg" || return 1
+    chmod 600 "$SI_STAGE/payload/ks.cfg" || return 1
+    awk '/^%pre / {active=1; next} /^%end/ {active=0} active' "$SI_STAGE/payload/ks.cfg" | bash -n || return 1
+    awk '/^%post / {active=1; next} /^%end/ {active=0} active' "$SI_STAGE/payload/ks.cfg" | bash -n || return 1
+    (
+        cd "$SI_STAGE/payload" || exit 1
+        printf '%s\n' ks.cfg | cpio -o -H newc | gzip -9 > "$SI_STAGE/kickstart.cpio.gz"
+    ) || return 1
+    gzip -t "$SI_STAGE/kickstart.cpio.gz" || return 1
+    path=$(gzip -dc "$SI_STAGE/kickstart.cpio.gz" | cpio -it 2>/dev/null) || return 1
+    [[ $path == ks.cfg ]] || { si_fail "Неверный состав архива Kickstart."; return 1; }
+    cat "$SI_STAGE/initrd.original.img" "$SI_STAGE/kickstart.cpio.gz" > "$SI_STAGE/initrd.img" || return 1
+    si_render_grub > "$SI_STAGE/custom.cfg" || return 1
+    chroot "$SI_MNT" /usr/bin/grub2-script-check "${SI_STAGE#"$SI_MNT"}/custom.cfg" || return 1
+    [[ ! -e $final && ! -L $final && ! -e $custom && ! -L $custom ]] ||
+        { si_fail "Файлы загрузчика изменились во время подготовки."; return 1; }
+    sync || return 1
+    mv "$SI_STAGE" "$final" || return 1
+    SI_STAGE=''
+    SI_FINAL_CREATED=1
+    # ln fails if custom.cfg already exists; do not overwrite any existing config.
+    ln "$final/custom.cfg" "$custom" || return 1
+    SI_CUSTOM_CREATED=1
+    chmod 600 "$custom" || return 1
+    sync || return 1
+    si_unmount || return 1
+    SI_SUCCESS=1
+    SI_ROOT_HASH=''
+    SI_KEYS_B64=''
+    si_ok "Подготовка завершена, диск размонтирован."
+    printf '\nТеперь выберите «Выйти из rescue» в панели Selectel.\n'
+    printf 'GRUB через 10 секунд запустит установку с очисткой /dev/%s.\n' "$SI_DISK"
+    printf 'Наблюдайте за Anaconda в консоли панели. По окончании VPS перезагрузится.\n'
+    printf 'Вход в AlmaLinux: root, прежний пароль CentOS или сохранённый SSH-ключ.\n'
+    printf 'В AlmaLinux скачайте скрипт повторно и выберите «Проверить установленную AlmaLinux».\n'
+}
+si_verify() {
+    local info=/root/selectel-alma-install.info ipaddr prefix gateway mac keys host dns value path iface='' rc=0
+    local expected_version actual_version verify_repo service
+    if [[ $(uname -s) != Linux ]] || ((EUID != 0)); then
+        si_fail "Проверка установленной системы запускается в Linux от root."
+        return 1
+    fi
+    actual_version=$(si_os_value /etc/os-release VERSION_ID)
+    if [[ $(si_os_value /etc/os-release ID) != almalinux ]] || ! si_alma_version_valid "$actual_version"; then
+        si_fail "Ожидается AlmaLinux 10."
+        return 1
+    fi
+    [[ -f /root/alma-clean-install.complete && -f $info && ! -L $info ]] ||
+        { si_fail "Не найдены отметки установки этим скриптом. Проверьте /root/alma-install-post.log."; return 1; }
+    expected_version=$(si_os_value "$info" VERSION)
+    si_alma_version_valid "$expected_version" ||
+        { si_fail "В файле параметров установки отсутствует корректная VERSION в формате 10.N."; return 1; }
+    verify_repo="${SI_REPO_ROOT}/${expected_version}/BaseOS/x86_64/os"
+    if [[ $actual_version != "$expected_version" ]]; then
+        si_fail "Установлена AlmaLinux $actual_version, при установке был выбран выпуск $expected_version."
+        rc=1
+    fi
+    si_require ip nmcli systemctl getenforce sshd sha256sum curl dnf findmnt swapon || return 1
+    ipaddr=$(si_os_value "$info" IP)
+    prefix=$(si_os_value "$info" PREFIX)
+    gateway=$(si_os_value "$info" GATEWAY)
+    mac=$(si_os_value "$info" MAC)
+    keys=$(si_os_value "$info" KEYS_SHA256)
+    host=$(si_os_value "$info" HOSTNAME)
+    dns=$(si_os_value "$info" DNS)
+    si_unicast_valid "$ipaddr" && si_unicast_valid "$gateway" && si_hostname_valid "$host" &&
+        [[ $prefix =~ ^([1-9]|[12][0-9]|30)$ && $mac =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] ||
+        { si_fail "Файл параметров установки повреждён."; return 1; }
+    cat /etc/almalinux-release
+    uname -r
+    df -hT / /boot
+    printf 'Идентификатор загрузки: '
+    cat /proc/sys/kernel/random/boot_id
+    [[ $(findmnt -n -o FSTYPE /) == xfs ]] || { si_fail "Корневая файловая система отличается от XFS."; rc=1; }
+    [[ $(cat /etc/hostname) == "$host" ]] || { si_fail "Имя сервера отличается от сохранённого."; rc=1; }
+    for path in /sys/class/net/*; do
+        [[ $(cat "$path/address" 2>/dev/null) != "$mac" ]] || iface=${path##*/}
+    done
+    if [[ -z $iface ]]; then
+        si_fail "Не найден адаптер с сохранённым MAC."; rc=1
+    else
+        ip -4 address show dev "$iface" | grep -F "inet $ipaddr/$prefix " || { si_fail "Не найден ожидаемый IPv4."; rc=1; }
+        ip -4 route show default | grep -F "via $gateway " || { si_fail "Не найден ожидаемый шлюз."; rc=1; }
+    fi
+    value=$(LC_ALL=C nmcli -g GENERAL.STATE connection show selectel-static 2>/dev/null)
+    [[ $value == activated ]] || { si_fail "Профиль selectel-static не активен."; rc=1; }
+    value=$(LC_ALL=C nmcli -g 802-3-ethernet.mac-address connection show selectel-static 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    [[ $value == "$mac" ]] || { si_fail "MAC в профиле отличается от сохранённого."; rc=1; }
+    value=$(LC_ALL=C nmcli -g connection.interface-name connection show selectel-static 2>/dev/null)
+    [[ -z $value || $value == -- ]] || { si_fail "В профиле появилась привязка к имени интерфейса."; rc=1; }
+    value=$(LC_ALL=C nmcli -g ipv4.method connection show selectel-static 2>/dev/null)
+    [[ $value == manual ]] || { si_fail "Метод IPv4 в профиле отличается от manual."; rc=1; }
+    value=$(LC_ALL=C nmcli -g ipv4.dns connection show selectel-static 2>/dev/null | tr -d '[:space:]')
+    [[ $value == "$dns" ]] || { si_fail "DNS в профиле отличаются от сохранённых."; rc=1; }
+    nmcli -f connection.interface-name,802-3-ethernet.mac-address,ipv4.addresses,ipv4.gateway,ipv4.dns connection show selectel-static || rc=1
+    for service in NetworkManager sshd qemu-guest-agent; do
+        if ! systemctl is-active --quiet "$service"; then
+            si_fail "Служба $service не активна."
+            rc=1
+        fi
+    done
+    systemctl --failed --no-pager
+    [[ $(systemctl is-system-running) == running ]] || { si_fail "systemd сообщает об ошибках или незавершённой загрузке."; rc=1; }
+    [[ $(getenforce) == Enforcing ]] || { si_fail "SELinux отличается от Enforcing."; rc=1; }
+    sshd -t || rc=1
+    if [[ $keys != '-' ]]; then
+        [[ $keys =~ ^[0-9a-f]{64}$ ]] &&
+            printf '%s  %s\n' "$keys" /root/.ssh/authorized_keys | sha256sum -c - || rc=1
+    fi
+    [[ -z $(swapon --noheadings --show) ]] || si_warn "Обнаружен swap; этот скрипт его не создаёт."
+    dnf check || rc=1
+    curl --fail --silent --show-error --head --connect-timeout 15 --max-time 30 "$verify_repo/.treeinfo" >/dev/null || rc=1
+    if ((rc)); then
+        si_fail "Есть ошибки. Проверьте вывод, /root/alma-install-post.log и /var/log/anaconda/."
+    else
+        si_ok "Проверки пройдены. После обычной перезагрузки снова выберите проверку в меню."
+    fi
+    return "$rc"
+}
+si_main() {
+    local mode=${1:-interactive} choice confirmation menu_default=0
+    case "$mode" in
+        --help|-h) si_help; return 0 ;;
+        interactive|--check|--verify) ;;
+        *) si_help >&2; return 2 ;;
+    esac
+    (($# <= 1)) || { si_help >&2; return 2; }
+    set -o pipefail
+    if [[ $mode == --verify ]]; then si_verify; return $?; fi
+    if [[ $mode == interactive ]]; then
+        [[ -t 0 && -t 1 ]] || { si_fail "Нужен интерактивный SSH-терминал. Скачайте файл и запустите bash ИМЯ_ФАЙЛА."; return 1; }
+        si_runtime_init || return 1
+        si_load_menu || return 1
+        [[ $(si_os_value /etc/os-release ID 2>/dev/null) != almalinux ]] || menu_default=1
+        printf '\nRISH: AlmaLinux на VPS/VDS Selectel\n\n'
+        printf 'Подготовка установки AlmaLinux %s выполняется в Rescue.\n' "$SI_ALMA_VERSION"
+        printf 'Проверка результата — в установленной AlmaLinux.\n\n'
+        vertical_menu current 2 0 5 nomouse "default=$menu_default" \
+            "Проверить VPS перед установкой" "Проверить установленную AlmaLinux" "Завершить"
+        choice=$?
+        case "$choice" in
+            0) ;;
+            1) si_verify; return $? ;;
+            *) return 0 ;;
+        esac
+    fi
+    si_alma_version_valid "$SI_ALMA_VERSION" ||
+        { si_fail "SI_ALMA_VERSION должен задавать выпуск AlmaLinux в формате 10.N."; return 1; }
+    si_platform || return 1
+    if [[ $mode == --check ]]; then si_runtime_init || return 1; fi
+    si_find_target && si_check_target && si_network && si_access && si_source_check || return 1
+    si_plan
+    if [[ $mode == --check ]]; then
+        si_ok "Проверка завершена. Запись на диск CentOS не выполнялась."
+        return 0
+    fi
+    printf '\n'
+    vertical_menu current 2 0 5 nomouse default=0 "Завершить без подготовки" "Подготовить чистую установку"
+    choice=$?
+    ((choice == 1)) || { si_info "Подготовка отменена."; return 0; }
+    printf '\nДля подтверждения очистки введите имя диска: %s\n> ' "$SI_DISK"
+    IFS= read -r confirmation || return 1
+    [[ $confirmation == "$SI_DISK" ]] || { si_info "Имя не совпало. Подготовка отменена."; return 0; }
+    si_prepare || { si_fail "Подготовка не завершена. Не выходите из Rescue; проверьте сообщение об ошибке."; return 1; }
+}
+
+si_load_menu() {
+    cat > "$SI_TMP/windows.sh" <<'SI_EMBEDDED_WINDOWS_EOF' || return 1
+#!/usr/bin/env bash
+#set -euo pipefail
+#IFS=$'\n\t'
+
+# little helpers for terminal print control and key input
+ESC=$( printf "\033")
+cursor_blink_on()     { printf "%s" "${ESC}[?25h"; }
+cursor_blink_off()    { printf "%s" "${ESC}[?25l"; }
+mouse_tracking_on()   { printf "%s" "${ESC}[?1000h${ESC}[?1006h"; }
+mouse_tracking_off()  { printf "%s" "${ESC}[?1006l${ESC}[?1000l"; }
+
+VERTICAL_MENU_LAST_WHEEL_MS=0
+VERTICAL_MENU_MOUSE_TRACKING_ENABLED=1
+
+# Метаданные последнего отрисованного меню (обновляются в vertical_menu)
+VERTICAL_MENU_LAST_WIDTH=0
+VERTICAL_MENU_LAST_OUTER_WIDTH=0
+VERTICAL_MENU_LAST_HEIGHT=0
+VERTICAL_MENU_LAST_X=0
+VERTICAL_MENU_LAST_Y=0
+VERTICAL_MENU_LAST_RIGHT_X=0
+VERTICAL_MENU_LAST_VISIBLE_SELECTED=0
+
+vertical_menu_next_x() {
+  local gap="${1:-1}"
+  echo $((VERTICAL_MENU_LAST_RIGHT_X + gap + 1))
+}
+
+cursor_to() {
+  local row="$1"
+  local col="${2:-1}"
+  printf "%s" "${ESC}[${row};${col}H"
+}
+
+print_option()        { printf "%s " "$1"; }
+print_selected_on()   { printf "%s" "${ESC}[7m"; }
+print_selected_off()  { printf "%s" "${ESC}[27m"; }
+
+clear_input_buffer() {
+  # Удаляем мусор из stdin
+  local dummy
+  while IFS= read -rsn1 -t 0.01 dummy 2>/dev/null; do :; done
+}
+
+drain_input_tail() {
+  # Слить хвост неизвестной escape-последовательности, чтобы он не "протек" в UI.
+  local dummy
+  while IFS= read -rsn1 -t 0.001 dummy 2>/dev/null; do :; done
+}
+
+vertical_menu_cleanup() {
+  mouse_tracking_off
+  cursor_blink_on
+  if [[ -n "$stty_state" ]]; then
+    stty "$stty_state"
+  fi
+}
+
+vertical_menu_restore_traps() {
+  if [[ -n "$previous_int_trap" ]]; then eval "$previous_int_trap"; else trap - INT; fi
+  if [[ -n "$previous_term_trap" ]]; then eval "$previous_term_trap"; else trap - TERM; fi
+  if [[ -n "$previous_hup_trap" ]]; then eval "$previous_hup_trap"; else trap - HUP; fi
+}
+
+vertical_menu_install_traps() {
+  trap 'vertical_menu_handle_signal INT' INT
+  trap 'vertical_menu_handle_signal TERM' TERM
+  trap 'vertical_menu_handle_signal HUP' HUP
+}
+
+vertical_menu_handle_signal() {
+  local signal="$1"
+  vertical_menu_cleanup
+  vertical_menu_restore_traps
+  kill -s "$signal" "$$"
+
+  # If the previous handler returned or ignored the signal, resume the menu.
+  vertical_menu_install_traps
+  if [[ -n "$stty_state" ]]; then
+    stty -echo
+  fi
+  if ((VERTICAL_MENU_MOUSE_TRACKING_ENABLED)); then
+    mouse_tracking_on
+  fi
+  cursor_blink_off
+}
+
+get_time_ms() {
+  local now
+
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    now="${EPOCHREALTIME/./}"
+    printf "%s\n" "${now:0:${#now}-3}"
+    return
+  fi
+
+  now=$(date +%s%3N)
+  [[ "$now" =~ ^[0-9]+$ ]] && printf "%s\n" "$now" || printf "0\n"
+}
+
+get_cursor_row() {
+    local row col
+    IFS=';' read -sdR -p $'\E[6n' row col
+    row=${row#*[}
+    [[ "$row" =~ ^[0-9]+$ ]] && echo "$row" || echo 1
+}
+
+get_cursor_column() {
+    local row col
+    IFS=';' read -sdR -p $'\E[6n' row col
+    [[ "$col" =~ ^[0-9]+$ ]] && echo "$col" || echo 1
+}
+repl() {
+    local char="$1"
+    local count="$2"
+    local out
+
+    ((count > 0)) || return
+    printf -v out "%*s" "$count" ""
+    printf "%s" "${out// /$char}"
+}
+key_input() {
+    local result_var="$1"
+    local key=""
+    local c1=""
+    local c2=""
+    local c=""
+    local esc=$'\e'
+    local mouse_sequence=""
+    local mouse_button
+    local mouse_x
+    local mouse_y
+    local mouse_action
+    local mouse_wheel_ms
+
+    IFS= read -rsn1 key 2>/dev/null || true
+
+    if [[ "$key" == "$esc" ]]; then
+        # Одиночный ESC: продолжения нет.
+        if ! IFS= read -rsn1 -t 0.008 c1 2>/dev/null; then
+            printf -v "$result_var" "%s" "esc"
+            return
+        fi
+
+        # Поддерживаем стрелки вверх/вниз и SGR-события мыши.
+        if [[ "$c1" == "[" || "$c1" == "O" ]]; then
+            if IFS= read -rsn1 -t 0.008 c2 2>/dev/null; then
+                case "$c2" in
+                    A) printf -v "$result_var" "%s" "up"; return ;;
+                    B) printf -v "$result_var" "%s" "down"; return ;;
+                    "<")
+                        while IFS= read -rsn1 -t 0.008 c 2>/dev/null; do
+                            if [[ "$c" == "M" || "$c" == "m" ]]; then
+                                mouse_action="$c"
+                                break
+                            fi
+                            mouse_sequence+="$c"
+                            ((${#mouse_sequence} < 32)) || break
+                        done
+                        IFS=';' read -r mouse_button mouse_x mouse_y <<< "$mouse_sequence"
+                        if [[ "$mouse_button" =~ ^[0-9]+$ && "$mouse_x" =~ ^[0-9]+$ && "$mouse_y" =~ ^[0-9]+$ ]]; then
+                            if ((mouse_button & 64)); then
+                                mouse_wheel_ms=$(get_time_ms)
+                                if ((mouse_wheel_ms > 0 &&
+                                     mouse_wheel_ms - VERTICAL_MENU_LAST_WHEEL_MS < 30)); then
+                                    printf -v "$result_var" "%s" "other:mouse_wheel_ignored"
+                                    return
+                                fi
+                                VERTICAL_MENU_LAST_WHEEL_MS=$mouse_wheel_ms
+                                case $((mouse_button & 3)) in
+                                    0) printf -v "$result_var" "%s" "up"; return ;;
+                                    1) printf -v "$result_var" "%s" "down"; return ;;
+                                esac
+                            fi
+                            if [[ "$mouse_action" == "m" ]] && (( (mouse_button & 3) == 0 )); then
+                                printf -v "$result_var" "%s" "mouse_click:${mouse_x}:${mouse_y}"
+                                return
+                            fi
+                            printf -v "$result_var" "%s" "other:mouse_ignored"
+                            return
+                        fi
+                        ;;
+                esac
+            fi
+        fi
+
+        # Неизвестный ESC-ввод: сливаем хвост, чтобы избежать артефактов.
+        drain_input_tail
+        printf -v "$result_var" "%s" "other:${esc}${c1}${c2}"
+        return
+    fi
+
+    if [[ -z "$key" ]]; then
+        printf -v "$result_var" "%s" "enter"
+    else
+        printf -v "$result_var" "%s" "other:$key"
+    fi
+}
+
+
+
+function refresh_window {
+# формат вызова
+# refresh_window y x height width shift "@"
+
+  local MaxWindowWidth
+  local left_x
+  local top_y
+  local ReturnKey=""
+  local temp
+  local -a ms
+  local -a menu_items
+  local height
+  local i=0
+  local shift_y
+  ms=( "$@" )
+  left_x=${ms[1]}
+  top_y=${ms[0]}
+  MaxWindowWidth=${ms[3]}
+  menu_items=( "${ms[@]:5}" )
+  height=${ms[2]}
+  shift_y=${ms[4]}
+
+  cursor_to $(($top_y )) $(($left_x))
+  printf "┌"
+  repl "─" $(( $MaxWindowWidth + 3 ))
+  printf "┐"
+
+  for ((i=0;i<${height};i++))
+  do
+    cursor_to $(($top_y + ${i}  + 1)) $(($left_x))
+    print_option "│  ${menu_items[${i}+${shift_y}]}"
+    repl " " $(( ${MaxWindowWidth}-${#menu_items[${i}+${shift_y}]} - 1 ))
+    print_vertical_menu_right_border "$i" "$height" "$shift_y" "${#menu_items[@]}"
+  done
+
+  cursor_to $(($top_y + ${i} +1 )) $(($left_x))
+  printf "└"
+  repl "─" $(( $MaxWindowWidth + 3 ))
+  printf "┘"
+}
+
+print_vertical_menu_right_border() {
+  local row="$1"
+  local height="$2"
+  local shift_y="$3"
+  local item_count="$4"
+
+  if ((row == 0 && shift_y > 0)); then
+    printf "↑│"
+  elif ((row == height - 1 && shift_y + height < item_count)); then
+    printf "↓│"
+  else
+    printf " │"
+  fi
+}
+
+print_vertical_menu_selected_row() {
+  local top_y="$1"
+  local left_x="$2"
+  local selected="$3"
+  local height="$4"
+  local MaxWindowWidth="$5"
+  local shift_y="$6"
+  local menu_item="$7"
+  local item_count="$8"
+
+  cursor_to $(($top_y + $selected + 1)) $(($left_x))
+  printf "│ "
+  print_selected_on
+  printf " ${menu_item}"
+  repl " " $(($MaxWindowWidth - ${#menu_item}))
+  print_selected_off
+  print_vertical_menu_right_border "$selected" "$height" "$shift_y" "$item_count"
+}
+
+function vertical_menu {
+  # формат вызова
+  # vertical_menu y x height width "@"
+  # если x = center - то центрирование по горизонтали
+  # если y = 	center - то центрирование по вертикали
+  # 		 =	current - выводим меню в текущей строке
+  # 		 =	current_noclear - выводим меню в текущей строке без очистки после выбора,
+  #                курсор ставится под меню
+  # если height = 0 - не устанавливать высоты (она будет посчитана автоматически)
+  #			  = число - установить высоту окна равную числу. Пункты меню будут скролироваться
+  #	width = число. Если строка будет больше этого числа - то ширина будет расширена до него
+  # если среди пунктов меню встречается слово default со знаком =, то это значит установка пункта меню по умолчанию
+  # этот пункт меню будет выбранным при выводе меню
+  # если среди аргументов встречается слово nomouse, то меню не включает mouse tracking
+  # это оставляет колесо мыши для прокрутки терминального scrollback
+  # vertical_menu y x height width  "default=2" "First Item" "Second Item" "Third Item"
+  local MaxWindowWidth
+  local left_x
+  local top_y
+  local ReturnKey=""
+  local -a ms
+  local -a menu_items
+  local size
+  local lines
+  local columns
+  local current_y
+  local is_current_mode=0
+  local skip_lines=0
+  local required_bottom
+  local scroll_lines=0
+  local max_visible_height
+  local stty_state=""
+  local height
+  local shift_y=0
+  local el
+  local arg
+  local previous_int_trap
+  local previous_term_trap
+  local previous_hup_trap
+  local selected
+  local previous_selected
+  local mouse_tracking_enabled=1
+  local previous_mouse_tracking_enabled=$VERTICAL_MENU_MOUSE_TRACKING_ENABLED
+  size=$(stty size)
+  lines=${size% *}
+  columns=${size#* }
+
+  # Обработка и удаление аргумента default, если он присутствует
+  local default_selected_index=0
+  local new_menu_items=()
+  for arg in "$@"; do
+    if [[ $arg == default=* ]]; then
+      default_selected_index=${arg#default=}
+    elif [[ $arg == "nomouse" ]]; then
+      mouse_tracking_enabled=0
+    else
+      new_menu_items+=("$arg")
+    fi
+  done
+
+  ms=("${new_menu_items[@]:0:4}")
+  menu_items=("${new_menu_items[@]:4}")
+  if ((${#menu_items[@]} == 0)); then
+    return 255
+  fi
+  left_x=${ms[1]}
+  top_y=${ms[0]}
+  MaxWindowWidth=${ms[3]}
+  clear_input_buffer
+  current_y=$(get_cursor_row)
+
+  if ((${ms[2]} == 0)); then
+    height=${#menu_items[@]}
+  else
+    # если требуемая высота больше чем количество пунктов меню, уменьшаем ее
+    if ((${ms[2]} > ${#menu_items[@]})); then
+      height=${#menu_items[@]}
+    else
+      height=${ms[2]}
+    fi
+  fi
+
+  max_visible_height=$((lines - 2))
+  if ((max_visible_height < 1)); then
+    max_visible_height=1
+  fi
+  if ((height > max_visible_height)); then
+    height=$max_visible_height
+  fi
+
+  if [[ ! "$default_selected_index" =~ ^[0-9]+$ ]] || ((default_selected_index >= ${#menu_items[@]})); then
+    default_selected_index=0
+  fi
+  if ((default_selected_index >= height)); then
+    shift_y=$((default_selected_index - height + 1))
+    selected=$((height - 1))
+  else
+    selected=${default_selected_index}
+  fi
+  previous_selected=${selected}
+
+  #find the width of the window
+  for el in "${menu_items[@]}"; do
+    if ((${MaxWindowWidth} < ${#el})); then
+      MaxWindowWidth=${#el}
+    fi
+  done
+  ((MaxWindowWidth = ${MaxWindowWidth} + 2))
+
+  if [[ ${ms[1]} == "center" ]]; then
+    ((left_x = (${columns} - ${MaxWindowWidth} - 6) / 2))
+  fi
+  if [[ ${ms[0]} == "center" ]]; then
+    ((top_y = (${lines} - ${height} - 2) / 2))
+  fi
+
+  if [[ ${ms[0]} == "current" || ${ms[0]} == "current_noclear" ]]; then
+    is_current_mode=1
+    top_y=${current_y}
+  fi
+
+  # Для любого режима обеспечиваем место под меню за счет скролла терминала.
+  required_bottom=$((top_y + height + 1))
+  if ((required_bottom > lines)); then
+    scroll_lines=$((required_bottom - lines))
+    if ((scroll_lines > 0)); then
+      echo -en ${ESC}"[${scroll_lines}S"
+      top_y=$((top_y - scroll_lines))
+      if ((is_current_mode == 1)); then
+        current_y=$top_y
+        skip_lines=$((skip_lines + scroll_lines))
+      fi
+    fi
+  fi
+
+  stty_state="$(stty -g 2>/dev/null || true)"
+  if [[ -n "$stty_state" ]]; then
+    stty -echo
+  fi
+  # Ensure terminal state is restored if the menu is interrupted while waiting for keys.
+  previous_int_trap="$(trap -p INT)"
+  previous_term_trap="$(trap -p TERM)"
+  previous_hup_trap="$(trap -p HUP)"
+  vertical_menu_install_traps
+  VERTICAL_MENU_MOUSE_TRACKING_ENABLED=$mouse_tracking_enabled
+  if ((VERTICAL_MENU_MOUSE_TRACKING_ENABLED)); then
+    mouse_tracking_on
+  fi
+  cursor_blink_off
+  refresh_window ${top_y} ${left_x} ${height} ${MaxWindowWidth} ${shift_y} "${menu_items[@]}"
+
+  # Сохраняем геометрию окна для последующего позиционирования
+  VERTICAL_MENU_LAST_WIDTH=${MaxWindowWidth}
+  VERTICAL_MENU_LAST_OUTER_WIDTH=$((MaxWindowWidth + 5))
+  VERTICAL_MENU_LAST_HEIGHT=$((height + 2))
+  VERTICAL_MENU_LAST_X=${left_x}
+  VERTICAL_MENU_LAST_Y=${top_y}
+  VERTICAL_MENU_LAST_RIGHT_X=$((left_x + VERTICAL_MENU_LAST_OUTER_WIDTH - 1))
+
+  while true; do
+    # print options by overwriting the last lines
+
+    cursor_to $(($top_y + $previous_selected + 1)) $(($left_x))
+    print_option "│  ${menu_items[$previous_selected + ${shift_y}]}"
+    repl " " $(($MaxWindowWidth - ${#menu_items[$previous_selected + ${shift_y}]} - 1))
+    print_vertical_menu_right_border "$previous_selected" "$height" "$shift_y" "${#menu_items[@]}"
+
+    print_vertical_menu_selected_row "$top_y" "$left_x" "$selected" "$height" "$MaxWindowWidth" "$shift_y" "${menu_items[$selected + $shift_y]}" "${#menu_items[@]}"
+
+    # user key control
+    key_input ReturnKey
+    case ${ReturnKey} in
+    enter) break ;;
+    esc)
+      selected=255
+      break
+      ;;
+    up)
+      previous_selected=${selected}
+      ((selected--))
+      if [[ ${selected} -lt 0 ]]; then
+        if ((${shift_y} > 0)); then
+          ((shift_y--))
+          refresh_window ${top_y} ${left_x} ${height} ${MaxWindowWidth} ${shift_y} "${menu_items[@]}"
+          cursor_blink_off
+        fi
+        selected=0
+      fi
+      ;;
+    down)
+      previous_selected=${selected}
+      ((selected++))
+      if [[ ${selected} -ge ${height} ]]; then
+        if (((${shift_y} + ${selected}) < ${#menu_items[@]})); then
+          ((shift_y++))
+          refresh_window ${top_y} ${left_x} ${height} ${MaxWindowWidth} ${shift_y} "${menu_items[@]}"
+          cursor_blink_off
+        fi
+        selected=${previous_selected}
+      fi
+      ;;
+    mouse_click:*)
+      local mouse_x
+      local mouse_y
+      IFS=':' read -r _ mouse_x mouse_y <<< "$ReturnKey"
+      if ((mouse_x >= left_x && mouse_x <= left_x + MaxWindowWidth + 4 &&
+           mouse_y >= top_y + 1 && mouse_y <= top_y + height)); then
+        cursor_to $(($top_y + $selected + 1)) $(($left_x))
+        print_option "│  ${menu_items[$selected + ${shift_y}]}"
+        repl " " $(($MaxWindowWidth - ${#menu_items[$selected + ${shift_y}]} - 1))
+        print_vertical_menu_right_border "$selected" "$height" "$shift_y" "${#menu_items[@]}"
+        selected=$((mouse_y - top_y - 1))
+        print_vertical_menu_selected_row "$top_y" "$left_x" "$selected" "$height" "$MaxWindowWidth" "$shift_y" "${menu_items[$selected + $shift_y]}" "${#menu_items[@]}"
+        sleep 0.08
+        break
+      fi
+      ;;
+    esac
+  done
+
+  VERTICAL_MENU_LAST_VISIBLE_SELECTED=${selected}
+
+  if ((is_current_mode == 1)); then
+    printf "\n"
+  fi
+  vertical_menu_cleanup
+  VERTICAL_MENU_MOUSE_TRACKING_ENABLED=$previous_mouse_tracking_enabled
+  vertical_menu_restore_traps
+  if ((is_current_mode == 1)); then
+    if [[ ${ms[0]} == "current" ]]; then
+      cursor_to ${current_y} 1
+    # очистить выведенное меню
+      echo -en ${ESC}"[0J"
+    else
+      cursor_to $((${top_y} + ${height} + 2)) 1
+    fi
+  else
+    cursor_to ${current_y} 1
+  fi
+  if ((selected != 255)); then
+    ((selected += ${shift_y}))
+  fi
+  return ${selected}
+}
+SI_EMBEDDED_WINDOWS_EOF
+    # shellcheck disable=SC1091
+    source "$SI_TMP/windows.sh" || return 1
+    declare -F vertical_menu >/dev/null
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    si_main "$@"
+fi
