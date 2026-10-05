@@ -5,7 +5,7 @@
 # Installer preparation never formats a disk or reboots the VPS itself.
 # Source this file to test the parsing/rendering functions without running main.
 
-SI_VERSION='1.0.10'
+SI_VERSION='1.0.11'
 # Select an available AlmaLinux 10.x release; installer checksums come from .treeinfo.
 SI_ALMA_VERSION='10.2'
 SI_REPO_ROOT='https://repo.almalinux.org/almalinux'
@@ -815,7 +815,7 @@ si_verify() {
     fi
     value=$(LC_ALL=C nmcli -g GENERAL.STATE connection show selectel-static 2>/dev/null)
     [[ $value == activated ]] || { si_fail "Профиль selectel-static не активен."; rc=1; }
-    value=$(LC_ALL=C nmcli -g 802-3-ethernet.mac-address connection show selectel-static 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    value=$(LC_ALL=C nmcli --escape no -g 802-3-ethernet.mac-address connection show selectel-static 2>/dev/null | tr '[:upper:]' '[:lower:]')
     [[ $value == "$mac" ]] || { si_fail "MAC в профиле отличается от сохранённого."; rc=1; }
     value=$(LC_ALL=C nmcli -g connection.interface-name connection show selectel-static 2>/dev/null)
     [[ -z $value || $value == -- ]] || { si_fail "В профиле появилась привязка к имени интерфейса."; rc=1; }
