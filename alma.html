@@ -5,7 +5,7 @@
 # Installer preparation never formats a disk or reboots the VPS itself.
 # Source this file to test the parsing/rendering functions without running main.
 
-SI_VERSION='1.0.9'
+SI_VERSION='1.0.10'
 # Select an available AlmaLinux 10.x release; installer checksums come from .treeinfo.
 SI_ALMA_VERSION='10.2'
 SI_REPO_ROOT='https://repo.almalinux.org/almalinux'
@@ -844,7 +844,14 @@ si_verify() {
     if ((rc)); then
         si_fail "Есть ошибки. Проверьте вывод, /root/alma-install-post.log и /var/log/anaconda/."
     else
-        si_ok "${SI_GREEN}Проверки пройдены${SI_WHITE}. После обычной перезагрузки снова выберите проверку в меню."
+        si_ok "${SI_GREEN}Проверки пройдены${SI_WHITE}. Установка завершена."
+        if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+            if rm -- "$0"; then
+                si_ok "Файл скрипта ${SI_GREEN}$0${SI_WHITE} удалён."
+            else
+                si_warn "Не удалось удалить файл скрипта ${SI_YELLOW}$0${SI_WHITE}."
+            fi
+        fi
     fi
     return "$rc"
 }
