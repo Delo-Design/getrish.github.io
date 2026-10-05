@@ -738,6 +738,7 @@ si_prepare() {
     printf 'GRUB через 10 секунд запустит установку с очисткой /dev/%s.\n' "$SI_DISK"
     printf 'Наблюдайте за Anaconda в консоли панели. По окончании VPS перезагрузится.\n'
     printf 'Вход в AlmaLinux: root, прежний пароль CentOS или сохранённый SSH-ключ.\n'
+    printf 'Подключение после установки: ssh root@%s\n' "$SI_IP"
     printf 'В AlmaLinux скачайте скрипт повторно и выберите «Проверить установленную AlmaLinux».\n'
 }
 si_verify() {
