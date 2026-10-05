@@ -5,7 +5,7 @@
 # Installer preparation never formats a disk or reboots the VPS itself.
 # Source this file to test the parsing/rendering functions without running main.
 
-SI_VERSION='1.0.5'
+SI_VERSION='1.0.6'
 # Select an available AlmaLinux 10.x release; installer checksums come from .treeinfo.
 SI_ALMA_VERSION='10.2'
 SI_REPO_ROOT='https://repo.almalinux.org/almalinux'
@@ -30,16 +30,32 @@ SI_KEYS_B64=''
 SI_KEYS_SHA='-'
 SI_KEYS_BYTES=0
 
+SI_GREEN=''
+SI_RED=''
+SI_YELLOW=''
+SI_WHITE=''
+if [[ -t 1 ]]; then
+    SI_GREEN=$'\033[0;32m'
+    SI_RED=$'\033[0;31m'
+    SI_YELLOW=$'\033[0;33m'
+    SI_WHITE=$'\033[0m'
+fi
+
 si_message() {
-    local label=$1 color=$2
+    local label=$1 color=$2 text plain code
     shift 2
+    text="$*"
+    plain=$text
+    for code in "$SI_GREEN" "$SI_RED" "$SI_YELLOW" "$SI_WHITE"; do
+        [[ -z $code ]] || plain=${plain//"$code"/}
+    done
     if [[ -t 1 ]]; then
-        printf '\033[%sm%s\033[0m %s\n' "$color" "$label" "$*"
+        printf '\033[0;%sm%s\033[0m %s\n' "$color" "$label" "$text"
     else
-        printf '%s %s\n' "$label" "$*"
+        printf '%s %s\n' "$label" "$plain"
     fi
     if [[ -n $SI_LOG ]]; then
-        printf '%s %s\n' "$label" "$*" >> "$SI_LOG"
+        printf '%s %s\n' "$label" "$plain" >> "$SI_LOG"
     fi
 }
 si_info() { si_message '[..]' '36' "$@"; }
@@ -48,7 +64,7 @@ si_warn() { si_message '[!]' '33' "$@"; }
 si_fail() { si_message '[ошибка]' '31' "$@" >&2; return 1; }
 
 si_help() {
-    printf 'RISH: установка AlmaLinux %s на VPS/VDS Selectel через Rescue\n' "$SI_ALMA_VERSION"
+    printf 'RISH: установка AlmaLinux %s на VPS/VDS Selectel через Rescue\n' "${SI_GREEN}$SI_ALMA_VERSION${SI_WHITE}"
     cat <<'HELP'
 
 bash selectel_almalinux.sh           Меню подготовки и проверки AlmaLinux
@@ -182,7 +198,7 @@ si_cleanup() {
         rmdir "$SI_LOCK" 2>/dev/null || true
     fi
     if [[ -n $SI_LOG ]]; then
-        printf '\nЖурнал скрипта: %s\n' "$SI_LOG"
+        printf '\nЖурнал скрипта: %s\n' "${SI_GREEN}$SI_LOG${SI_WHITE}"
     fi
     exit "$code"
 }
@@ -303,7 +319,7 @@ si_find_target() {
     [[ $count =~ ^[0-9]+$ ]] || return 1
     SI_DISK_BYTES=$((count * 512))
     ((SI_DISK_BYTES >= 10737418240)) || { si_fail "Диск меньше 10 ГиБ."; return 1; }
-    si_info "Ищу CentOS Stream 9 на /dev/$SI_DISK; разделы читаются без записи."
+    si_info "Ищу ${SI_GREEN}CentOS Stream 9${SI_WHITE} на ${SI_GREEN}/dev/$SI_DISK${SI_WHITE}; разделы читаются без записи."
     for part in "${SI_PARTS[@]}"; do
         blkid "$part" | grep -Fq 'TYPE="ext4"' || continue
         si_mount_ro "$part" || { si_fail "Не удалось прочитать $part."; return 1; }
@@ -357,7 +373,7 @@ si_check_target() {
     file=$(si_target_file etc/hostname) || { si_fail "Не найдено имя сервера в CentOS."; return 1; }
     SI_HOST=$(cat "$file")
     si_hostname_valid "$SI_HOST" || { si_fail "Имя сервера должно быть корректным DNS-именем латиницей."; return 1; }
-    si_ok "CentOS Stream 9, GPT, BIOS, ext4 и процессор x86-64-v3 проверены."
+    si_ok "CentOS Stream 9, GPT, BIOS, ext4 и процессор x86-64-v3 ${SI_GREEN}проверены${SI_WHITE}."
 }
 si_parse_routes() {
     local line token prev gateway dev count=0
@@ -429,7 +445,7 @@ si_network() {
     SI_DNS_INI=$(printf '%s;' "${SI_DNS[@]}")
     SI_DNS_BOOT=''
     for value in "${SI_DNS[@]}"; do SI_DNS_BOOT+=" nameserver=$value"; done
-    si_ok "Параметры работающей сети Rescue определены."
+    si_ok "Параметры работающей сети Rescue ${SI_GREEN}определены${SI_WHITE}."
 }
 si_access() {
     local file
@@ -452,7 +468,7 @@ si_access() {
     fi
     SI_NM_UUID=$(cat /proc/sys/kernel/random/uuid) || return 1
     [[ $SI_NM_UUID =~ ^[0-9a-f-]{36}$ ]] || return 1
-    si_ok "Хеш пароля root прочитан. authorized_keys будет перенесён целиком ($SI_KEYS_BYTES байт)."
+    si_ok "Хеш пароля root ${SI_GREEN}прочитан${SI_WHITE}. authorized_keys будет перенесён целиком (${SI_GREEN}$SI_KEYS_BYTES${SI_WHITE} байт)."
 }
 si_recheck_access() {
     local expected_hash=$SI_ROOT_HASH expected_keys=$SI_KEYS_SHA
@@ -544,22 +560,27 @@ si_treeinfo_load() {
 si_source_check() {
     SI_KERNEL_SHA=''
     SI_INITRD_SHA=''
-    si_info "Проверяю HTTPS и установочное дерево AlmaLinux $SI_ALMA_VERSION."
+    si_info "Проверяю HTTPS и установочное дерево ${SI_GREEN}AlmaLinux $SI_ALMA_VERSION${SI_WHITE}."
     si_download "$SI_REPO/.treeinfo" "$SI_TMP/treeinfo" ||
         { si_fail "Не удалось получить .treeinfo. Проверьте сеть, DNS и время в Rescue."; return 1; }
     si_treeinfo_load "$SI_TMP/treeinfo" || return 1
-    si_ok "Источник доступен, метаданные проверены, SHA-256 ядра и initrd получены из .treeinfo."
+    si_ok "Источник ${SI_GREEN}доступен${SI_WHITE}, метаданные ${SI_GREEN}проверены${SI_WHITE}, SHA-256 ядра и initrd получены из .treeinfo."
 }
 si_plan() {
-    printf '\nAlmaLinux %s — план чистой установки\n\n' "$SI_ALMA_VERSION"
-    printf 'Диск:        /dev/%s (%s байт)\n' "$SI_DISK" "$SI_DISK_BYTES"
-    printf 'CentOS:      %s, UUID %s\n' "$SI_ROOT_PART" "$SI_ROOT_UUID"
-    printf 'IPv4:        %s/%s\nШлюз:        %s\nDNS:         %s\n' "$SI_IP" "$SI_PREFIX" "$SI_GATEWAY" "$SI_DNS_CSV"
-    printf 'Адаптер:     %s, MAC %s\nИмя сервера: %s\n' "$SI_IFACE" "$SI_MAC" "$SI_HOST"
-    printf 'Доступ:      прежний пароль root; authorized_keys — %s байт\n' "$SI_KEYS_BYTES"
-    printf '\nРазметка: BIOS Boot 2 МиБ, /boot 1 ГиБ, всё остальное — / (XFS).\n'
+    printf '\nAlmaLinux %s — план чистой установки\n\n' "${SI_GREEN}$SI_ALMA_VERSION${SI_WHITE}"
+    printf 'Диск:        %s (%s байт)\n' \
+        "${SI_GREEN}/dev/$SI_DISK${SI_WHITE}" "${SI_GREEN}$SI_DISK_BYTES${SI_WHITE}"
+    printf 'CentOS:      %s, UUID %s\n' \
+        "${SI_GREEN}$SI_ROOT_PART${SI_WHITE}" "${SI_GREEN}$SI_ROOT_UUID${SI_WHITE}"
+    printf 'IPv4:        %s\nШлюз:        %s\nDNS:         %s\n' \
+        "${SI_GREEN}$SI_IP/$SI_PREFIX${SI_WHITE}" "${SI_GREEN}$SI_GATEWAY${SI_WHITE}" "${SI_GREEN}$SI_DNS_CSV${SI_WHITE}"
+    printf 'Адаптер:     %s, MAC %s\nИмя сервера: %s\n' \
+        "${SI_GREEN}$SI_IFACE${SI_WHITE}" "${SI_GREEN}$SI_MAC${SI_WHITE}" "${SI_GREEN}$SI_HOST${SI_WHITE}"
+    printf 'Доступ:      прежний пароль root; authorized_keys — %s байт\n' "${SI_GREEN}$SI_KEYS_BYTES${SI_WHITE}"
+    printf '\nРазметка: BIOS Boot 2 МиБ, %s 1 ГиБ, всё остальное — %s (%s).\n' \
+        "${SI_GREEN}/boot${SI_WHITE}" "${SI_GREEN}/${SI_WHITE}" "${SI_GREEN}XFS${SI_WHITE}"
     printf 'Отдельных /home, LVM и swap не будет.\n\n'
-    si_warn "После выхода из Rescue установщик удалит ВСЕ разделы и данные /dev/$SI_DISK."
+    si_warn "После выхода из Rescue установщик ${SI_YELLOW}удалит ВСЕ разделы и данные /dev/$SI_DISK${SI_WHITE}."
 }
 si_render_kickstart() {
     cat <<KICKSTART
@@ -697,9 +718,9 @@ si_prepare() {
     SI_STAGE=$(mktemp -d "$SI_MNT/boot/.rish-alma.XXXXXX") || return 1
     mkdir -m 700 "$SI_STAGE/payload" || return 1
     cp "$SI_TMP/treeinfo" "$SI_STAGE/.treeinfo" || return 1
-    si_info "Скачиваю ядро AlmaLinux."
+    si_info "Скачиваю ядро ${SI_GREEN}AlmaLinux${SI_WHITE}."
     si_download "$SI_REPO/images/pxeboot/vmlinuz" "$SI_STAGE/vmlinuz" || return 1
-    si_info "Скачиваю initrd. Это может занять несколько минут."
+    si_info "Скачиваю ${SI_GREEN}initrd${SI_WHITE}. Это может занять несколько минут."
     si_download "$SI_REPO/images/pxeboot/initrd.img" "$SI_STAGE/initrd.original.img" || return 1
     printf '%s  %s\n' "$SI_KERNEL_SHA" vmlinuz \
         "$SI_INITRD_SHA" initrd.original.img > "$SI_STAGE/SHA256SUMS" || return 1
@@ -733,12 +754,12 @@ si_prepare() {
     SI_SUCCESS=1
     SI_ROOT_HASH=''
     SI_KEYS_B64=''
-    si_ok "Подготовка завершена, диск размонтирован."
-    printf '\nТеперь выберите «Выйти из rescue» в панели Selectel.\n'
-    printf 'GRUB через 10 секунд запустит установку с очисткой /dev/%s.\n' "$SI_DISK"
+    si_ok "${SI_GREEN}Подготовка завершена${SI_WHITE}, диск размонтирован."
+    printf '\nТеперь выберите «%s» в панели Selectel.\n' "${SI_GREEN}Выйти из rescue${SI_WHITE}"
+    printf 'GRUB через 10 секунд запустит установку с очисткой %s.\n' "${SI_YELLOW}/dev/$SI_DISK${SI_WHITE}"
     printf 'Наблюдайте за Anaconda в консоли панели. По окончании VPS перезагрузится.\n'
     printf 'Вход в AlmaLinux: root, прежний пароль CentOS или сохранённый SSH-ключ.\n'
-    printf 'Подключение после установки: ssh root@%s\n' "$SI_IP"
+    printf 'Подключение после установки: %s\n' "${SI_GREEN}ssh root@$SI_IP${SI_WHITE}"
     printf 'В AlmaLinux скачайте скрипт повторно и выберите «Проверить установленную AlmaLinux».\n'
 }
 si_verify() {
@@ -821,7 +842,7 @@ si_verify() {
     if ((rc)); then
         si_fail "Есть ошибки. Проверьте вывод, /root/alma-install-post.log и /var/log/anaconda/."
     else
-        si_ok "Проверки пройдены. После обычной перезагрузки снова выберите проверку в меню."
+        si_ok "${SI_GREEN}Проверки пройдены${SI_WHITE}. После обычной перезагрузки снова выберите проверку в меню."
     fi
     return "$rc"
 }
@@ -840,11 +861,11 @@ si_main() {
         si_runtime_init || return 1
         si_load_menu || return 1
         [[ $(si_os_value /etc/os-release ID 2>/dev/null) != almalinux ]] || menu_default=1
-        printf '\nRISH: AlmaLinux на VPS/VDS Selectel\n\n'
-        printf 'Подготовка установки AlmaLinux %s выполняется в Rescue.\n' "$SI_ALMA_VERSION"
+        printf '\nRISH: %s на VPS/VDS Selectel\n\n' "${SI_GREEN}AlmaLinux${SI_WHITE}"
+        printf 'Подготовка установки AlmaLinux %s выполняется в Rescue.\n' "${SI_GREEN}$SI_ALMA_VERSION${SI_WHITE}"
         printf 'Проверка результата — в установленной AlmaLinux.\n\n'
         vertical_menu current 2 0 5 nomouse "default=$menu_default" \
-            "Проверить VPS перед установкой" "Проверить установленную AlmaLinux" "Выйти"
+            "Подготовить установку AlmaLinux" "Проверить установленную AlmaLinux" "Выйти"
         choice=$?
         case "$choice" in
             0) ;;
@@ -859,14 +880,14 @@ si_main() {
     si_find_target && si_check_target && si_network && si_access && si_source_check || return 1
     si_plan
     if [[ $mode == --check ]]; then
-        si_ok "Проверка завершена. Запись на диск CentOS не выполнялась."
+        si_ok "${SI_GREEN}Проверка завершена${SI_WHITE}. Запись на диск CentOS не выполнялась."
         return 0
     fi
     printf '\n'
     vertical_menu current 2 0 5 nomouse default=0 "Выйти" "Подготовить установку"
     choice=$?
     ((choice == 1)) || return 0
-    si_prepare || { si_fail "Подготовка не завершена. Не выходите из Rescue; проверьте сообщение об ошибке."; return 1; }
+    si_prepare || { si_fail "${SI_RED}Подготовка не завершена${SI_WHITE}. Не выходите из Rescue; проверьте сообщение об ошибке."; return 1; }
 }
 
 si_load_menu() {
