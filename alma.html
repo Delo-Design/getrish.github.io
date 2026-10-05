@@ -5,7 +5,7 @@
 # Installer preparation never formats a disk or reboots the VPS itself.
 # Source this file to test the parsing/rendering functions without running main.
 
-SI_VERSION='1.0.4'
+SI_VERSION='1.0.5'
 # Select an available AlmaLinux 10.x release; installer checksums come from .treeinfo.
 SI_ALMA_VERSION='10.2'
 SI_REPO_ROOT='https://repo.almalinux.org/almalinux'
@@ -593,12 +593,12 @@ qemu-guest-agent
 %end
 
 %pre --interpreter=/bin/bash --erroronfail --log=/tmp/alma-preflight.log
-set -euo pipefail
+set -euxo pipefail
 test "\$(blockdev --getsize64 /dev/$SI_DISK)" = "$SI_DISK_BYTES"
 test "\$(blkid -s UUID -o value $SI_ROOT_PART)" = "$SI_ROOT_UUID"
 test "\$(cat /sys/class/net/install0/address)" = "$SI_MAC"
 test ! -d /sys/firmware/efi
-test "\$(lsblk -dn -o TYPE | grep -c '^disk\$')" = 1
+test "\$(lsblk -dn -o NAME,TYPE | awk '\$2 == "disk" && \$1 ~ /^(sd[a-z]+|vd[a-z]+|nvme[0-9]+n[0-9]+)\$/ {count++} END {print count+0}')" = 1
 ip -4 address show dev install0 | grep -F "inet $SI_IP/$SI_PREFIX "
 ip -4 route show default | grep -F "via $SI_GATEWAY "
 printf '%s\n' 'Disk, BIOS and network checks passed.'
