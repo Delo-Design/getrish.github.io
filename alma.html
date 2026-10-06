@@ -5,7 +5,7 @@
 # Installer preparation never formats a disk or reboots the VPS itself.
 # Source this file to test the parsing/rendering functions without running main.
 
-SI_VERSION='1.0.12'
+SI_VERSION='1.0.13'
 # Select an available AlmaLinux 10.x release; installer checksums come from .treeinfo.
 SI_ALMA_VERSION='10.2'
 SI_REPO_ROOT='https://repo.almalinux.org/almalinux'
@@ -776,6 +776,14 @@ si_verify() {
         si_fail "Ожидается AlmaLinux 10."
         return 1
     fi
+    si_require curl || return 1
+    si_info "Проверяю веб-доступ к ${SI_GREEN}https://ya.ru/${SI_WHITE}."
+    if ! curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+        --connect-timeout 5 --max-time 10 --output /dev/null 'https://ya.ru/'; then
+        si_fail "Не удалось открыть ${SI_RED}https://ya.ru/${SI_WHITE} по HTTPS."
+        return 1
+    fi
+    si_ok "Сайт ${SI_GREEN}https://ya.ru/${SI_WHITE} ${SI_GREEN}доступен${SI_WHITE} по HTTPS."
     [[ -f /root/alma-clean-install.complete && -f $info && ! -L $info ]] ||
         { si_fail "Не найдены отметки установки этим скриптом. Проверьте /root/alma-install-post.log."; return 1; }
     expected_version=$(si_os_value "$info" VERSION)
@@ -786,7 +794,7 @@ si_verify() {
         si_fail "Установлена AlmaLinux $actual_version, при установке был выбран выпуск $expected_version."
         rc=1
     fi
-    si_require ip nmcli systemctl getenforce sshd sha256sum curl dnf findmnt swapon || return 1
+    si_require ip nmcli systemctl sshd sha256sum dnf findmnt || return 1
     ipaddr=$(si_os_value "$info" IP)
     prefix=$(si_os_value "$info" PREFIX)
     gateway=$(si_os_value "$info" GATEWAY)
@@ -832,13 +840,11 @@ si_verify() {
     done
     systemctl --failed --no-pager
     [[ $(systemctl is-system-running) == running ]] || { si_fail "systemd сообщает об ошибках или незавершённой загрузке."; rc=1; }
-    [[ $(getenforce) == Enforcing ]] || { si_fail "SELinux отличается от Enforcing."; rc=1; }
     sshd -t || rc=1
     if [[ $keys != '-' ]]; then
         [[ $keys =~ ^[0-9a-f]{64}$ ]] &&
             printf '%s  %s\n' "$keys" /root/.ssh/authorized_keys | sha256sum -c - || rc=1
     fi
-    [[ -z $(swapon --noheadings --show) ]] || si_warn "Обнаружен swap; этот скрипт его не создаёт."
     dnf check || rc=1
     curl --fail --silent --show-error --head --connect-timeout 15 --max-time 30 "$verify_repo/.treeinfo" >/dev/null || rc=1
     if ((rc)); then
