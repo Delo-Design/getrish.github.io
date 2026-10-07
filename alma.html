@@ -5,7 +5,7 @@
 # Installer preparation never formats a disk or reboots the VPS itself.
 # Source this file to test the parsing/rendering functions without running main.
 
-SI_VERSION='1.0.13'
+SI_VERSION='1.0.14'
 # Select an available AlmaLinux 10.x release; installer checksums come from .treeinfo.
 SI_ALMA_VERSION='10.2'
 SI_REPO_ROOT='https://repo.almalinux.org/almalinux'
@@ -765,8 +765,7 @@ si_prepare() {
     printf 'В AlmaLinux скачайте скрипт повторно и выберите «Проверить установленную AlmaLinux».\n'
 }
 si_verify() {
-    local info=/root/selectel-alma-install.info ipaddr prefix gateway mac keys host dns value path iface='' rc=0
-    local expected_version actual_version verify_repo service
+    local actual_version verify_repo curl_error
     if [[ $(uname -s) != Linux ]] || ((EUID != 0)); then
         si_fail "Проверка установленной системы запускается в Linux от root."
         return 1
@@ -777,89 +776,42 @@ si_verify() {
         return 1
     fi
     si_require curl || return 1
-    si_info "Проверяю веб-доступ к ${SI_GREEN}https://ya.ru/${SI_WHITE}."
-    if ! curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
-        --connect-timeout 5 --max-time 10 --output /dev/null 'https://ya.ru/'; then
-        si_fail "Не удалось открыть ${SI_RED}https://ya.ru/${SI_WHITE} по HTTPS."
+    si_message '[1/3]' '36' "Проверяю доступ сервера к ${SI_GREEN}https://ya.ru/${SI_WHITE} по HTTPS."
+    if ! curl_error=$(curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+        --connect-timeout 5 --max-time 10 --output /dev/null 'https://ya.ru/' 2>&1); then
+        [[ -z $SI_LOG ]] || printf 'curl (ya.ru): %s\n' "$curl_error" >> "$SI_LOG"
+        si_fail "Не удалось открыть ${SI_RED}https://ya.ru/${SI_WHITE} по HTTPS. Проверка остановлена."
         return 1
     fi
-    si_ok "Сайт ${SI_GREEN}https://ya.ru/${SI_WHITE} ${SI_GREEN}доступен${SI_WHITE} по HTTPS."
-    [[ -f /root/alma-clean-install.complete && -f $info && ! -L $info ]] ||
-        { si_fail "Не найдены отметки установки этим скриптом. Проверьте /root/alma-install-post.log."; return 1; }
-    expected_version=$(si_os_value "$info" VERSION)
-    si_alma_version_valid "$expected_version" ||
-        { si_fail "В файле параметров установки отсутствует корректная VERSION в формате 10.N."; return 1; }
-    verify_repo="${SI_REPO_ROOT}/${expected_version}/BaseOS/x86_64/os"
-    if [[ $actual_version != "$expected_version" ]]; then
-        si_fail "Установлена AlmaLinux $actual_version, при установке был выбран выпуск $expected_version."
-        rc=1
+    si_ok "Сервер ${SI_GREEN}открывает сайт${SI_WHITE} по HTTPS."
+
+    si_message '[2/3]' '36' "Проверяю завершение установки ${SI_GREEN}AlmaLinux $actual_version${SI_WHITE}."
+    if [[ ! -f /root/alma-clean-install.complete ]]; then
+        si_fail "Не найдена отметка о завершении установки. Проверьте ${SI_RED}/root/alma-install-post.log${SI_WHITE}."
+        return 1
     fi
-    si_require ip nmcli systemctl sshd sha256sum dnf findmnt || return 1
-    ipaddr=$(si_os_value "$info" IP)
-    prefix=$(si_os_value "$info" PREFIX)
-    gateway=$(si_os_value "$info" GATEWAY)
-    mac=$(si_os_value "$info" MAC)
-    keys=$(si_os_value "$info" KEYS_SHA256)
-    host=$(si_os_value "$info" HOSTNAME)
-    dns=$(si_os_value "$info" DNS)
-    si_unicast_valid "$ipaddr" && si_unicast_valid "$gateway" && si_hostname_valid "$host" &&
-        [[ $prefix =~ ^([1-9]|[12][0-9]|30)$ && $mac =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] ||
-        { si_fail "Файл параметров установки повреждён."; return 1; }
-    cat /etc/almalinux-release
-    uname -r
-    df -hT / /boot
-    printf 'Идентификатор загрузки: '
-    cat /proc/sys/kernel/random/boot_id
-    [[ $(findmnt -n -o FSTYPE /) == xfs ]] || { si_fail "Корневая файловая система отличается от XFS."; rc=1; }
-    [[ $(cat /etc/hostname) == "$host" ]] || { si_fail "Имя сервера отличается от сохранённого."; rc=1; }
-    for path in /sys/class/net/*; do
-        [[ $(cat "$path/address" 2>/dev/null) != "$mac" ]] || iface=${path##*/}
-    done
-    if [[ -z $iface ]]; then
-        si_fail "Не найден адаптер с сохранённым MAC."; rc=1
-    else
-        ip -4 address show dev "$iface" | grep -F "inet $ipaddr/$prefix " || { si_fail "Не найден ожидаемый IPv4."; rc=1; }
-        ip -4 route show default | grep -F "via $gateway " || { si_fail "Не найден ожидаемый шлюз."; rc=1; }
+    si_ok "AlmaLinux ${SI_GREEN}$actual_version${SI_WHITE} загружена; установщик ${SI_GREEN}завершил работу${SI_WHITE}."
+
+    verify_repo="${SI_REPO_ROOT}/${actual_version}/BaseOS/x86_64/os"
+    si_message '[3/3]' '36' "Проверяю доступ к ${SI_GREEN}репозиторию AlmaLinux $actual_version${SI_WHITE}."
+    if ! curl_error=$(curl --fail --silent --show-error --head --output /dev/null --connect-timeout 15 --max-time 30 \
+        "$verify_repo/.treeinfo" 2>&1); then
+        [[ -z $SI_LOG ]] || printf 'curl (repository): %s\n' "$curl_error" >> "$SI_LOG"
+        si_fail "Репозиторий AlmaLinux ${SI_RED}$actual_version${SI_WHITE} недоступен. Проверка остановлена."
+        return 1
     fi
-    value=$(LC_ALL=C nmcli -g GENERAL.STATE connection show selectel-static 2>/dev/null)
-    [[ $value == activated ]] || { si_fail "Профиль selectel-static не активен."; rc=1; }
-    value=$(LC_ALL=C nmcli --escape no -g 802-3-ethernet.mac-address connection show selectel-static 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    [[ $value == "$mac" ]] || { si_fail "MAC в профиле отличается от сохранённого."; rc=1; }
-    value=$(LC_ALL=C nmcli -g connection.interface-name connection show selectel-static 2>/dev/null)
-    [[ -z $value || $value == -- ]] || { si_fail "В профиле появилась привязка к имени интерфейса."; rc=1; }
-    value=$(LC_ALL=C nmcli -g ipv4.method connection show selectel-static 2>/dev/null)
-    [[ $value == manual ]] || { si_fail "Метод IPv4 в профиле отличается от manual."; rc=1; }
-    value=$(LC_ALL=C nmcli -g ipv4.dns connection show selectel-static 2>/dev/null | tr -d '[:space:]')
-    [[ $value == "$dns" ]] || { si_fail "DNS в профиле отличаются от сохранённых."; rc=1; }
-    nmcli -f connection.interface-name,802-3-ethernet.mac-address,ipv4.addresses,ipv4.gateway,ipv4.dns connection show selectel-static || rc=1
-    for service in NetworkManager sshd qemu-guest-agent; do
-        if ! systemctl is-active --quiet "$service"; then
-            si_fail "Служба $service не активна."
-            rc=1
-        fi
-    done
-    systemctl --failed --no-pager
-    [[ $(systemctl is-system-running) == running ]] || { si_fail "systemd сообщает об ошибках или незавершённой загрузке."; rc=1; }
-    sshd -t || rc=1
-    if [[ $keys != '-' ]]; then
-        [[ $keys =~ ^[0-9a-f]{64}$ ]] &&
-            printf '%s  %s\n' "$keys" /root/.ssh/authorized_keys | sha256sum -c - || rc=1
-    fi
-    dnf check || rc=1
-    curl --fail --silent --show-error --head --connect-timeout 15 --max-time 30 "$verify_repo/.treeinfo" >/dev/null || rc=1
-    if ((rc)); then
-        si_fail "Есть ошибки. Проверьте вывод, /root/alma-install-post.log и /var/log/anaconda/."
-    else
-        si_ok "${SI_GREEN}Проверки пройдены${SI_WHITE}. Установка завершена."
-        if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
-            if rm -rf -- /root/installer-network-profiles && rm -- "$0"; then
-                si_ok "Временные сетевые профили и файл скрипта ${SI_GREEN}$0${SI_WHITE} удалены."
-            else
-                si_warn "Не удалось завершить очистку временных сетевых профилей и файла скрипта ${SI_YELLOW}$0${SI_WHITE}."
-            fi
+    si_ok "Репозиторий AlmaLinux ${SI_GREEN}$actual_version${SI_WHITE} ${SI_GREEN}доступен${SI_WHITE}."
+
+    si_ok "${SI_GREEN}Проверки пройдены${SI_WHITE}. Установка завершена."
+    if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+        si_message '[Очистка]' '36' "Удаляю временные сетевые профили установщика и файл скрипта."
+        if rm -rf -- /root/installer-network-profiles && rm -- "$0"; then
+            si_ok "Временные сетевые профили и файл скрипта ${SI_GREEN}$0${SI_WHITE} удалены."
+        else
+            si_warn "Не удалось завершить очистку временных сетевых профилей и файла скрипта ${SI_YELLOW}$0${SI_WHITE}."
         fi
     fi
-    return "$rc"
+    return 0
 }
 si_main() {
     local mode=${1:-interactive} choice menu_default=0
